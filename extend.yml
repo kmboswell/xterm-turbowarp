@@ -24,6 +24,9 @@ extension:
     onOff:
       acceptReporters: true
       items: ["on", "off"]
+    timestampStyles:
+      acceptReporters: true
+      items: ["clock", "uptime"]
 
 blocks:
   - opcode: initializeTerminal
@@ -44,6 +47,12 @@ blocks:
   - opcode: lastTerminalError
     blockType: reporter
     text: "last terminal error"
+  - opcode: terminalColumns
+    blockType: reporter
+    text: "terminal columns"
+  - opcode: terminalRows
+    blockType: reporter
+    text: "terminal rows"
 
   - "---"
 
@@ -102,6 +111,14 @@ blocks:
         type: string
         menu: onOff
         defaultValue: "off"
+  - opcode: setTimestampStyle
+    blockType: command
+    text: "set timestamp style [STYLE]"
+    arguments:
+      STYLE:
+        type: string
+        menu: timestampStyles
+        defaultValue: "clock"
 
   - "---"
 

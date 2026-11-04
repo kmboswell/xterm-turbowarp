@@ -4,6 +4,8 @@ import { hideTerminal } from "./blocks/hideTerminal.js";
 import { clearTerminal } from "./blocks/clearTerminal.js";
 import { terminalReady } from "./blocks/terminalReady.js";
 import { lastTerminalError } from "./blocks/lastTerminalError.js";
+import { terminalColumns } from "./blocks/terminalColumns.js";
+import { terminalRows } from "./blocks/terminalRows.js";
 import { promptUser } from "./blocks/promptUser.js";
 import { readKey } from "./blocks/readKey.js";
 import { cancelPrompt } from "./blocks/cancelPrompt.js";
@@ -12,6 +14,7 @@ import { setLogLevelFilter } from "./blocks/setLogLevelFilter.js";
 import { setLogScopeFilter } from "./blocks/setLogScopeFilter.js";
 import { clearLogFilters } from "./blocks/clearLogFilters.js";
 import { setTimestamps } from "./blocks/setTimestamps.js";
+import { setTimestampStyle } from "./blocks/setTimestampStyle.js";
 import { boxText } from "./blocks/boxText.js";
 import { divider } from "./blocks/divider.js";
 import { dividerLabeled } from "./blocks/dividerLabeled.js";
@@ -26,6 +29,8 @@ export const blocks = {
   clearTerminal,
   terminalReady,
   lastTerminalError,
+  terminalColumns,
+  terminalRows,
   promptUser,
   readKey,
   cancelPrompt,
@@ -34,6 +39,7 @@ export const blocks = {
   setLogScopeFilter,
   clearLogFilters,
   setTimestamps,
+  setTimestampStyle,
   boxText,
   divider,
   dividerLabeled,
@@ -190,6 +196,12 @@ export function setup() {
   let lastError = "";
   let activeTheme = DEFAULT_THEME;
   let timestampsEnabled = false;
+  let timestampStyle = "clock";
+  // "Project started" is when the project began running, not when the extension
+  // happened to load: setup() runs once at load, and the runtime's PROJECT_START
+  // event (green flag / project start) refreshes this instant. Uptime
+  // timestamps count from it.
+  let projectStartedAt = Date.now();
   let levelFilter = null;
   let scopeFilter = null;
   const promptQueue = [];
@@ -777,6 +789,15 @@ export function setup() {
     writeOutput({ kind: "writeln", text: String(text) });
   }
 
+  function formatTimestamp() {
+    if (!timestampsEnabled) return "";
+    if (timestampStyle === "uptime") {
+      const seconds = Math.max(0, Date.now() - projectStartedAt) / 1000;
+      return ANSI.DIM + "[" + seconds.toFixed(4) + "]" + ANSI.RESET + " ";
+    }
+    return ANSI.DIM + new Date().toLocaleTimeString() + ANSI.RESET + " ";
+  }
+
   function formatLog(args) {
     const levelKey = String(args.LEVEL);
     const scope = String(
@@ -787,9 +808,7 @@ export function setup() {
     if (scopeFilter && scopeFilter.indexOf(scope) === -1) return null;
 
     const config = LEVELS[levelKey] || LEVELS.info;
-    const timestamp = timestampsEnabled
-      ? ANSI.DIM + new Date().toLocaleTimeString() + ANSI.RESET + " "
-      : "";
+    const timestamp = formatTimestamp();
     const label = config.label.padEnd(MAX_LABEL_WIDTH);
     const prefix = timestamp + config.color + ANSI.BOLD + config.icon + " " + label + ANSI.RESET;
     const scopeFormat = scope ? ANSI.DIM + "[" + scope + "]" + ANSI.RESET + " " : "";
@@ -890,12 +909,17 @@ export function setup() {
     const onStopAll = () => cancelPrompts(() => true);
     const onStopForTarget = (target) =>
       cancelPrompts((prompt) => prompt.target === target);
+    const onProjectStart = () => {
+      projectStartedAt = Date.now();
+    };
     runtime.on("PROJECT_STOP_ALL", onStopAll);
     runtime.on("STOP_FOR_TARGET", onStopForTarget);
+    runtime.on("PROJECT_START", onProjectStart);
     runtime.on("RUNTIME_DISPOSED", () => {
       if (typeof runtime.removeListener === "function") {
         runtime.removeListener("PROJECT_STOP_ALL", onStopAll);
         runtime.removeListener("STOP_FOR_TARGET", onStopForTarget);
+        runtime.removeListener("PROJECT_START", onProjectStart);
       }
     });
   }
