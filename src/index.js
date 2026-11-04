@@ -254,7 +254,9 @@ export function setup() {
       return vendor;
     }
     if (typeof XTERM_VENDOR_BUNDLE !== "function") {
-      throw new Error("The bundled xterm code is missing. Run `npm run build`.");
+      throw new Error(
+        "The bundled xterm code is missing. Run `npm run build`.",
+      );
     }
     vendor = XTERM_VENDOR_BUNDLE();
     return vendor;
@@ -517,7 +519,11 @@ export function setup() {
       if (text[index] === "\x1b") {
         const escape = readEscape(text, index);
         if (escape) {
-          if (escape.name && escape.name !== "PasteStart" && escape.name !== "PasteEnd") {
+          if (
+            escape.name &&
+            escape.name !== "PasteStart" &&
+            escape.name !== "PasteEnd"
+          ) {
             handlePromptKey(prompt, escape.name);
           }
           index += escape.length;
@@ -750,7 +756,9 @@ export function setup() {
     if (!requireTerminal()) {
       return Promise.resolve("");
     }
-    const text = String(promptText === undefined || promptText === null ? "" : promptText);
+    const text = String(
+      promptText === undefined || promptText === null ? "" : promptText,
+    );
     return new Promise((resolve) => {
       // util is only valid during the block's synchronous execution, so the
       // target reference is captured now and never re-read later.
@@ -795,7 +803,9 @@ export function setup() {
   }
 
   function parseFilter(input) {
-    const text = String(input === undefined || input === null ? "" : input).trim();
+    const text = String(
+      input === undefined || input === null ? "" : input,
+    ).trim();
     if (text === "" || text === "*") return null;
     return text
       .split(",")
@@ -863,10 +873,22 @@ export function setup() {
     const config = LEVELS[levelKey] || LEVELS.info;
     const timestamp = formatTimestamp();
     const label = config.label.padEnd(MAX_LABEL_WIDTH);
-    const prefix = timestamp + config.color + ANSI.BOLD + config.icon + " " + label + ANSI.RESET;
-    const scopeFormat = scope ? ANSI.DIM + "[" + scope + "]" + ANSI.RESET + " " : "";
+    const prefix =
+      timestamp +
+      config.color +
+      ANSI.BOLD +
+      config.icon +
+      " " +
+      label +
+      ANSI.RESET;
+    const scopeFormat = scope
+      ? ANSI.DIM + "[" + scope + "]" + ANSI.RESET + " "
+      : "";
 
-    return { kind: "writeln", text: prefix + " " + scopeFormat + String(args.TEXT) };
+    return {
+      kind: "writeln",
+      text: prefix + " " + scopeFormat + String(args.TEXT),
+    };
   }
 
   function log(args) {
@@ -942,11 +964,15 @@ export function setup() {
 
     const left = Math.floor((width - label.length) / 2);
     const right = width - label.length - left;
-    terminal.writeln(ANSI.DIM + "─".repeat(left) + label + "─".repeat(right) + ANSI.RESET);
+    terminal.writeln(
+      ANSI.DIM + "─".repeat(left) + label + "─".repeat(right) + ANSI.RESET,
+    );
   }
 
   function applyTheme(name) {
-    activeTheme = THEMES[String(name).toLowerCase()] ? String(name).toLowerCase() : DEFAULT_THEME;
+    activeTheme = THEMES[String(name).toLowerCase()]
+      ? String(name).toLowerCase()
+      : DEFAULT_THEME;
     if (!terminal) return;
     terminal.options.theme = THEMES[activeTheme];
     if (container) {
