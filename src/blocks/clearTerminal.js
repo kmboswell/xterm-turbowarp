@@ -1,5 +1,4 @@
 export function clearTerminal() {
-  if (terminal) {
-    terminal.clear();
-  }
+  if (!requireTerminal()) return;
+  terminal.clear();
 }

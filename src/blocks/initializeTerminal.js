@@ -1,5 +1,5 @@
 export function initializeTerminal() {
-  return init().catch((err) => {
-    console.error("Xterm: failed to initialize the terminal.", err);
-  });
+  // init() records the reason in lastError, which the `last terminal error`
+  // reporter exposes; swallowing the rejection keeps the project running.
+  return init().catch(() => {});
 }

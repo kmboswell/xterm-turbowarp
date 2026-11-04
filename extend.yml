@@ -1,6 +1,6 @@
 name: "Xterm"
-version: "0.1.2"
-description: "A terminal emulator overlay for the stage, powered by xterm.js."
+version: "1.0.0"
+description: "Xterm, for TurboWarp."
 author: "Kamix Fox"
 license: "Apache-2.0"
 
@@ -19,10 +19,14 @@ extension:
       items: ["atom-one-dark", "atom-one-light", "dracula", "solarized"]
     levels:
       acceptReporters: true
-      items: ["info", "success", "warn", "error", "debug", "start", "trace", "fatal"]
+      items:
+        ["info", "success", "warn", "error", "debug", "start", "trace", "fatal"]
     onOff:
       acceptReporters: true
       items: ["on", "off"]
+    timestampStyles:
+      acceptReporters: true
+      items: ["clock", "uptime"]
 
 blocks:
   - opcode: initializeTerminal
@@ -37,6 +41,18 @@ blocks:
   - opcode: clearTerminal
     blockType: command
     text: "clear terminal"
+  - opcode: terminalReady
+    blockType: boolean
+    text: "terminal ready?"
+  - opcode: lastTerminalError
+    blockType: reporter
+    text: "last terminal error"
+  - opcode: terminalColumns
+    blockType: reporter
+    text: "terminal columns"
+  - opcode: terminalRows
+    blockType: reporter
+    text: "terminal rows"
 
   - "---"
 
@@ -47,6 +63,9 @@ blocks:
       TEXT:
         type: string
         defaultValue: "Enter command: "
+  - opcode: readKey
+    blockType: reporter
+    text: "read key"
   - opcode: cancelPrompt
     blockType: command
     text: "cancel pending prompts"
@@ -92,6 +111,14 @@ blocks:
         type: string
         menu: onOff
         defaultValue: "off"
+  - opcode: setTimestampStyle
+    blockType: command
+    text: "set timestamp style [STYLE]"
+    arguments:
+      STYLE:
+        type: string
+        menu: timestampStyles
+        defaultValue: "clock"
 
   - "---"
 
@@ -136,3 +163,9 @@ blocks:
       THEME:
         type: string
         menu: themes
+
+  - "---"
+
+  - opcode: disposeTerminal
+    blockType: command
+    text: "dispose terminal"

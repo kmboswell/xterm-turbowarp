@@ -2,38 +2,52 @@ import { initializeTerminal } from "./blocks/initializeTerminal.js";
 import { showTerminal } from "./blocks/showTerminal.js";
 import { hideTerminal } from "./blocks/hideTerminal.js";
 import { clearTerminal } from "./blocks/clearTerminal.js";
+import { terminalReady } from "./blocks/terminalReady.js";
+import { lastTerminalError } from "./blocks/lastTerminalError.js";
+import { terminalColumns } from "./blocks/terminalColumns.js";
+import { terminalRows } from "./blocks/terminalRows.js";
 import { promptUser } from "./blocks/promptUser.js";
+import { readKey } from "./blocks/readKey.js";
 import { cancelPrompt } from "./blocks/cancelPrompt.js";
 import { logMessage } from "./blocks/logMessage.js";
 import { setLogLevelFilter } from "./blocks/setLogLevelFilter.js";
 import { setLogScopeFilter } from "./blocks/setLogScopeFilter.js";
 import { clearLogFilters } from "./blocks/clearLogFilters.js";
 import { setTimestamps } from "./blocks/setTimestamps.js";
+import { setTimestampStyle } from "./blocks/setTimestampStyle.js";
 import { boxText } from "./blocks/boxText.js";
 import { divider } from "./blocks/divider.js";
 import { dividerLabeled } from "./blocks/dividerLabeled.js";
 import { writeToTerminal } from "./blocks/writeToTerminal.js";
 import { writeLineToTerminal } from "./blocks/writeLineToTerminal.js";
 import { setTheme } from "./blocks/setTheme.js";
+import { disposeTerminal } from "./blocks/disposeTerminal.js";
 
 export const blocks = {
   initializeTerminal,
   showTerminal,
   hideTerminal,
   clearTerminal,
+  terminalReady,
+  lastTerminalError,
+  terminalColumns,
+  terminalRows,
   promptUser,
+  readKey,
   cancelPrompt,
   logMessage,
   setLogLevelFilter,
   setLogScopeFilter,
   clearLogFilters,
   setTimestamps,
+  setTimestampStyle,
   boxText,
   divider,
   dividerLabeled,
   writeToTerminal,
   writeLineToTerminal,
   setTheme,
+  disposeTerminal,
 };
 
 /**
@@ -155,20 +169,21 @@ export function setup() {
 
   const DEFAULT_THEME = "atom-one-dark";
 
-  const XTERM_CSS_URL = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css";
-  const XTERM_JS_URL = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js";
-  const XTERM_FIT_URL =
-    "https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js";
-  const XTERM_CSS_INTEGRITY =
-    "sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh";
-  const XTERM_JS_INTEGRITY =
-    "sha384-/nfmYPUzWMS6v2atn8hbljz7NE0EI1iGx34lJaNzyVjWGDzMv+ciUZUeJpKA3Glc";
-  const XTERM_FIT_INTEGRITY =
-    "sha384-AQLWHRKAgdTxkolJcLOELg4E9rE89CPE2xMy3tIRFn08NcGKPTsELdvKomqji+DL";
+  const NOT_READY_ERROR = "Terminal is not initialized.";
+  const OUTPUT_BUFFER_LIMIT = 1000;
+  // Total text retained before the terminal exists. The entry limit alone would
+  // let one huge write hold an unbounded string.
+  const OUTPUT_BUFFER_CHARS = 100000;
+  const HISTORY_LIMIT = 100;
 
-  // Kept as an array of single-line rules: Twext re-indents setup code but leaves
-  // the contents of multi-line template literals untouched.
-  const XTERM_CSS = [
+  // scripts/inline-vendor.js replaces this literal with the bundled xterm and
+  // xterm-addon-fit builds during `npm run build`, so starting the terminal never
+  // makes a network request. The xterm stylesheet rides along in the same bundle.
+  const XTERM_VENDOR_BUNDLE = "@@XTERM_VENDOR_BUNDLE@@";
+
+  // Extra rules on top of the bundled xterm.css. Kept as an array of single-line
+  // strings: the build re-indents setup code but never string contents.
+  const XTERM_CSS_OVERRIDES = [
     ".xterm-viewport::-webkit-scrollbar { display: none !important; }",
     ".xterm-viewport { -ms-overflow-style: none !important; scrollbar-width: none !important; }",
     ".xterm { width: 100% !important; height: 100% !important; padding: 4px; box-sizing: border-box; }",
@@ -180,13 +195,53 @@ export function setup() {
   let fitAddon = null;
   let resizeObserver = null;
   let initPromise = null;
+  // Bumped by teardown so a deferred terminal creation from an earlier init
+  // cannot install a terminal after the extension was disposed.
+  let generation = 0;
   let isVisible = false;
+  let vendor = null;
+  let styleElement = null;
+  let stageElement = null;
+  let stagePosition = null;
 
+  let lastError = "";
   let activeTheme = DEFAULT_THEME;
   let timestampsEnabled = false;
+  let timestampStyle = "clock";
+  // "Project started" is when the project began running, not when the extension
+  // happened to load: setup() runs once at load, and the runtime's PROJECT_START
+  // event (green flag / project start) refreshes this instant. Uptime
+  // timestamps count from it.
+  let projectStartedAt = Date.now();
   let levelFilter = null;
   let scopeFilter = null;
   const promptQueue = [];
+  const keyQueue = [];
+  // Lines left over from a multi-line paste, handed to the following prompts.
+  const pendingLines = [];
+  // Recently submitted non-empty lines, oldest first, de-duplicated.
+  const history = [];
+  // Output produced before the terminal exists is held here as already-formatted
+  // entries, so the filters and timestamp style from write time still apply when
+  // it is flushed. Bounded so a project that never initializes cannot grow it
+  // without limit; the oldest entry is dropped first.
+  const outputQueue = [];
+  // Total retained text across outputQueue entries, so the character budget
+  // above is enforced without walking the queue on every write.
+  let outputChars = 0;
+
+  function errorText(err) {
+    if (err && err.message) return String(err.message);
+    return String(err === undefined || err === null ? "unknown error" : err);
+  }
+
+  // Every block that needs a live terminal goes through this, so a failure is
+  // recorded in `last terminal error` instead of silently doing nothing.
+  function requireTerminal() {
+    if (terminal) return true;
+    lastError = NOT_READY_ERROR;
+    return false;
+  }
 
   function getStageCanvas() {
     const runtime =
@@ -196,42 +251,35 @@ export function setup() {
     return (runtime && runtime.canvas) || document.querySelector("canvas");
   }
 
+  // The inlined bundle is plain code: calling this function runs it once. No
+  // <script> tag, string-compiled code or Blob URL is involved, so it cannot be
+  // blocked by a missing inline-script permission.
+  function getVendor() {
+    if (vendor) return vendor;
+    // Test seam: a fake implementation can be installed before the first
+    // initialize so tests never evaluate the full xterm bundle.
+    const override =
+      typeof window !== "undefined" ? window.__XTERM_TEST_VENDOR__ : null;
+    if (override) {
+      vendor = override;
+      return vendor;
+    }
+    if (typeof XTERM_VENDOR_BUNDLE !== "function") {
+      throw new Error(
+        "The bundled xterm code is missing. Run `npm run build`.",
+      );
+    }
+    vendor = XTERM_VENDOR_BUNDLE();
+    return vendor;
+  }
+
   function injectStyles() {
     if (document.getElementById("xterm-twext-css")) return;
     const style = document.createElement("style");
     style.id = "xterm-twext-css";
-    style.textContent = XTERM_CSS;
+    style.textContent = (getVendor().css || "") + "\n" + XTERM_CSS_OVERRIDES;
     document.head.appendChild(style);
-  }
-
-  function loadScripts() {
-    if (window.Terminal && window.FitAddon) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      injectStyles();
-
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      link.href = XTERM_CSS_URL;
-      link.integrity = XTERM_CSS_INTEGRITY;
-      link.crossOrigin = "anonymous";
-      document.head.appendChild(link);
-
-      const script = document.createElement("script");
-      script.src = XTERM_JS_URL;
-      script.integrity = XTERM_JS_INTEGRITY;
-      script.crossOrigin = "anonymous";
-      script.onload = () => {
-        const fitScript = document.createElement("script");
-        fitScript.src = XTERM_FIT_URL;
-        fitScript.integrity = XTERM_FIT_INTEGRITY;
-        fitScript.crossOrigin = "anonymous";
-        fitScript.onload = resolve;
-        fitScript.onerror = reject;
-        document.head.appendChild(fitScript);
-      };
-      script.onerror = reject;
-      document.head.appendChild(script);
-    });
+    styleElement = style;
   }
 
   function safeFit() {
@@ -255,6 +303,7 @@ export function setup() {
     if (!stage) return null;
 
     container = document.createElement("div");
+    container.id = "xterm-twext-container";
     container.style.position = "absolute";
     container.style.top = "0";
     container.style.left = "0";
@@ -266,6 +315,9 @@ export function setup() {
     container.style.overflow = "hidden";
 
     if (getComputedStyle(stage).position === "static") {
+      // Remember the original value so teardown can undo this change.
+      stageElement = stage;
+      stagePosition = stage.style.position;
       stage.style.position = "relative";
     }
     stage.appendChild(container);
@@ -287,26 +339,344 @@ export function setup() {
     }
   }
 
-  function onTerminalData(data) {
-    const prompt = promptQueue[0];
-    if (!prompt || data.startsWith("\x1b")) return;
-    for (const character of data) {
-      if (character === "\r") {
-        terminal.write("\r\n");
-        promptQueue.shift();
-        prompt.resolve(prompt.buffer);
-        startNextPrompt();
-        return;
-      } else if (character === "\x7f") {
-        if (prompt.buffer.length > 0) {
-          prompt.buffer = prompt.buffer.slice(0, -1);
-          terminal.write("\b \b");
-        }
-      } else if (character >= " " && !(character >= "\x80" && character <= "\x9f")) {
-        prompt.buffer += character;
-        terminal.write(character);
+  // Key sequences xterm reports through onData. Longer sequences come first so
+  // "\x1b[3~" is not mistaken for a bare Escape.
+  const KEY_SEQUENCES = [
+    ["\x1b[200~", "PasteStart"],
+    ["\x1b[201~", "PasteEnd"],
+    ["\x1b[1;5C", "CtrlArrowRight"],
+    ["\x1b[1;5D", "CtrlArrowLeft"],
+    ["\x1b[3~", "Delete"],
+    ["\x1b[2~", "Insert"],
+    ["\x1b[5~", "PageUp"],
+    ["\x1b[6~", "PageDown"],
+    ["\x1b[1~", "Home"],
+    ["\x1b[4~", "End"],
+    ["\x1b[7~", "Home"],
+    ["\x1b[8~", "End"],
+    ["\x1b[A", "ArrowUp"],
+    ["\x1b[B", "ArrowDown"],
+    ["\x1b[C", "ArrowRight"],
+    ["\x1b[D", "ArrowLeft"],
+    ["\x1b[H", "Home"],
+    ["\x1b[F", "End"],
+    ["\x1bOH", "Home"],
+    ["\x1bOF", "End"],
+    ["\x1b", "Escape"],
+  ];
+
+  function readEscape(text, start) {
+    for (let i = 0; i < KEY_SEQUENCES.length; i++) {
+      const sequence = KEY_SEQUENCES[i][0];
+      // The bare escape is only the last resort, after whole CSI sequences have
+      // been tried, otherwise an unlisted "\x1b[..." would be read as Escape
+      // followed by literal text.
+      if (sequence === "\x1b") continue;
+      if (text.startsWith(sequence, start)) {
+        return { name: KEY_SEQUENCES[i][1], length: sequence.length };
       }
     }
+    // Unknown CSI sequences are consumed whole so their bytes are never typed
+    // into the line as literal text.
+    const match = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(text.slice(start));
+    if (match) return { name: "", length: match[0].length };
+    // Anything else that starts with an escape is a lone Escape keypress.
+    if (text.startsWith("\x1b", start)) return { name: "Escape", length: 1 };
+    return null;
+  }
+
+  function toCodePoints(text) {
+    return Array.from(String(text));
+  }
+
+  // Pasted lines never go through the key parser, so whole escape sequences are
+  // dropped first (an ESC alone would leave their parameters behind), then any
+  // remaining C0/C1 control characters, matching how typed input is filtered.
+  function sanitizeLine(text) {
+    return String(text)
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      .replace(/\x1b[@-_]/g, "")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  }
+
+  // Row of the live cursor, used to repaint a wrapped prompt from its origin.
+  function promptRow() {
+    const active = terminal && terminal.buffer && terminal.buffer.active;
+    if (!active) return null;
+    return active.baseY + active.cursorY;
+  }
+
+  function promptValue(prompt) {
+    return prompt.buffer.join("");
+  }
+
+  function rememberHistory(value) {
+    const text = String(value);
+    if (text === "") return;
+    const existing = history.indexOf(text);
+    if (existing !== -1) history.splice(existing, 1);
+    history.push(text);
+    if (history.length > HISTORY_LIMIT) history.shift();
+  }
+
+  function redrawPrompt(prompt) {
+    if (!terminal) return;
+    const before = prompt.buffer.slice(0, prompt.cursor).join("");
+    const after = prompt.buffer.slice(prompt.cursor).join("");
+    // Repaint from the prompt's first row, not just the caret's row, so a line
+    // that wrapped leaves no stale cells behind. xterm exposes the live cursor
+    // row, so the origin recorded when the prompt was painted says how far up
+    // the first row is.
+    const row = promptRow();
+    let rowsUp = 0;
+    if (row !== null) {
+      if (prompt.originRow !== null && prompt.originRow !== undefined) {
+        rowsUp = Math.max(0, row - prompt.originRow);
+      }
+    } else {
+      // No buffer (test doubles): a submitted line always ends with a newline,
+      // so the prompt starts at column 0 and its width gives the row count.
+      const width = Math.max(1, terminal.cols || 80);
+      rowsUp = Math.floor((prompt.text.length + before.length) / width);
+    }
+    terminal.write("\r");
+    if (rowsUp > 0) terminal.write("\x1b[" + rowsUp + "A");
+    // Erase the whole prompt (all its wrapped rows), then draw it again from the
+    // origin, saving/restoring the cursor instead of measuring cell widths.
+    terminal.write("\x1b[0J" + prompt.text + before);
+    terminal.write("\x1b7");
+    if (after) terminal.write(after);
+    terminal.write("\x1b[0K\x1b8");
+  }
+
+  function setPromptText(prompt, text) {
+    prompt.buffer = toCodePoints(text);
+    prompt.cursor = prompt.buffer.length;
+    redrawPrompt(prompt);
+  }
+
+  function insertPromptText(prompt, text) {
+    const points = toCodePoints(text);
+    if (points.length === 0) return;
+    prompt.buffer = prompt.buffer
+      .slice(0, prompt.cursor)
+      .concat(points, prompt.buffer.slice(prompt.cursor));
+    prompt.cursor += points.length;
+    redrawPrompt(prompt);
+  }
+
+  function deleteBackward(prompt) {
+    if (prompt.cursor === 0) return;
+    prompt.buffer.splice(prompt.cursor - 1, 1);
+    prompt.cursor -= 1;
+    redrawPrompt(prompt);
+  }
+
+  function deleteForward(prompt) {
+    if (prompt.cursor >= prompt.buffer.length) return;
+    prompt.buffer.splice(prompt.cursor, 1);
+    redrawPrompt(prompt);
+  }
+
+  function historyUp(prompt) {
+    if (history.length === 0) return;
+    if (prompt.historyIndex === null) {
+      prompt.draft = prompt.buffer.slice();
+      prompt.historyIndex = history.length - 1;
+    } else if (prompt.historyIndex > 0) {
+      prompt.historyIndex -= 1;
+    } else {
+      return;
+    }
+    setPromptText(prompt, history[prompt.historyIndex]);
+  }
+
+  function historyDown(prompt) {
+    if (prompt.historyIndex === null) return;
+    if (prompt.historyIndex < history.length - 1) {
+      prompt.historyIndex += 1;
+      setPromptText(prompt, history[prompt.historyIndex]);
+      return;
+    }
+    prompt.historyIndex = null;
+    const draft = prompt.draft || [];
+    prompt.draft = null;
+    prompt.buffer = draft;
+    prompt.cursor = draft.length;
+    redrawPrompt(prompt);
+  }
+
+  function submitPrompt(prompt) {
+    if (promptQueue[0] !== prompt) return;
+    const value = promptValue(prompt);
+    terminal.write("\r\n");
+    rememberHistory(value);
+    promptQueue.shift();
+    prompt.resolve(value);
+    startNextPrompt();
+  }
+
+  function cancelActivePrompt() {
+    const prompt = promptQueue[0];
+    if (!prompt) return;
+    terminal.write("^C\r\n");
+    promptQueue.shift();
+    prompt.resolve("");
+    startNextPrompt();
+  }
+
+  function handlePromptKey(prompt, name) {
+    if (name === "ArrowLeft") {
+      if (prompt.cursor > 0) {
+        prompt.cursor -= 1;
+        redrawPrompt(prompt);
+      }
+    } else if (name === "ArrowRight") {
+      if (prompt.cursor < prompt.buffer.length) {
+        prompt.cursor += 1;
+        redrawPrompt(prompt);
+      }
+    } else if (name === "Home") {
+      prompt.cursor = 0;
+      redrawPrompt(prompt);
+    } else if (name === "End") {
+      prompt.cursor = prompt.buffer.length;
+      redrawPrompt(prompt);
+    } else if (name === "Delete") {
+      deleteForward(prompt);
+    } else if (name === "Backspace") {
+      deleteBackward(prompt);
+    } else if (name === "ArrowUp") {
+      historyUp(prompt);
+    } else if (name === "ArrowDown") {
+      historyDown(prompt);
+    }
+  }
+
+  function handlePromptCharacter(prompt, character) {
+    if (character === "\r" || character === "\n") {
+      submitPrompt(prompt);
+    } else if (character === "\x03") {
+      cancelActivePrompt();
+    } else if (character === "\x7f" || character === "\b") {
+      deleteBackward(prompt);
+    } else if (character === "\t") {
+      insertPromptText(prompt, "  ");
+    } else if (character >= " ") {
+      insertPromptText(prompt, character);
+    }
+  }
+
+  function parseInputChunk(text, prompt) {
+    let index = 0;
+    while (index < text.length) {
+      if (text[index] === "\x1b") {
+        const escape = readEscape(text, index);
+        if (escape) {
+          if (
+            escape.name &&
+            escape.name !== "PasteStart" &&
+            escape.name !== "PasteEnd"
+          ) {
+            handlePromptKey(prompt, escape.name);
+          }
+          index += escape.length;
+        } else {
+          index += 1;
+        }
+      } else {
+        const character = String.fromCodePoint(text.codePointAt(index));
+        index += character.length;
+        handlePromptCharacter(prompt, character);
+      }
+      // Submitting or cancelling replaces the active prompt; stop feeding it.
+      if (promptQueue[0] !== prompt) return;
+    }
+  }
+
+  function describeKey(data) {
+    if (!data) return "";
+    const escape = readEscape(data, 0);
+    if (escape) return escape.name;
+    const character = String.fromCodePoint(data.codePointAt(0));
+    if (character === "\r" || character === "\n") return "Enter";
+    if (character === "\t") return "Tab";
+    if (character === "\x7f" || character === "\b") return "Backspace";
+    if (character === "\x03") return "Ctrl+C";
+    return character >= " " ? character : "";
+  }
+
+  function handleKeyInput(data) {
+    if (keyQueue.length === 0) return;
+    const name = describeKey(data);
+    if (!name) return;
+    const entry = keyQueue.shift();
+    entry.resolve(name);
+    if (keyQueue.length === 0 && promptQueue.length === 0) {
+      setInputEnabled(false);
+    }
+  }
+
+  function waitForKey(util) {
+    if (!requireTerminal()) return "";
+    setInputEnabled(true);
+    return new Promise((resolve) => {
+      // util is only valid during the block's synchronous execution, so capture
+      // the target now: a stop event must cancel exactly this read.
+      keyQueue.push({ resolve, target: util ? util.target : null });
+    });
+  }
+
+  // Resolve reads whose thread was stopped, so they cannot swallow a later
+  // keypress meant for the next run.
+  function cancelKeyReads(match) {
+    if (keyQueue.length === 0) return;
+    const kept = [];
+    for (let i = 0; i < keyQueue.length; i++) {
+      const entry = keyQueue[i];
+      if (match(entry)) {
+        entry.resolve("");
+      } else {
+        kept.push(entry);
+      }
+    }
+    keyQueue.length = 0;
+    for (let i = 0; i < kept.length; i++) {
+      keyQueue.push(kept[i]);
+    }
+    if (keyQueue.length === 0 && promptQueue.length === 0) {
+      setInputEnabled(false);
+    }
+  }
+
+  function onTerminalData(data) {
+    // Bracketed paste markers wrap pasted text; they are not part of it.
+    const raw = String(data).replace(/\x1b\[20[01]~/g, "");
+    if (promptQueue.length === 0) {
+      handleKeyInput(raw);
+      return;
+    }
+
+    const prompt = promptQueue[0];
+    if (/\r|\n/.test(raw)) {
+      // A paste with several lines completes this prompt with the first line.
+      // The rest are queued before the submit so a prompt that is already
+      // waiting consumes them in order instead of losing them.
+      const lines = raw.split(/\r\n|\r|\n/);
+      const rest = lines.slice(1);
+      if (rest.length > 0 && rest[rest.length - 1] === "") rest.pop();
+      for (let i = 0; i < rest.length; i++) {
+        pendingLines.push(rest[i]);
+      }
+      parseInputChunk(lines[0], prompt);
+      if (promptQueue[0] === prompt) {
+        submitPrompt(prompt);
+      }
+      return;
+    }
+
+    parseInputChunk(raw, prompt);
   }
 
   function init() {
@@ -315,14 +685,21 @@ export function setup() {
     // cannot both build a terminal.
     if (initPromise) return initPromise;
 
-    initPromise = loadScripts()
+    // A dispose can land before the deferred creation below runs; this records
+    // which attempt is allowed to install a terminal.
+    const attempt = generation;
+
+    initPromise = Promise.resolve()
       .then(() => {
+        if (attempt !== generation) return null;
+        injectStyles();
         const host = ensureContainer();
         if (!host) {
           throw new Error("Xterm could not find the stage canvas.");
         }
 
-        terminal = new window.Terminal({
+        const bundle = getVendor();
+        terminal = new bundle.Terminal({
           // Blinking is off by default; it is enabled only for the duration of a prompt.
           cursorBlink: false,
           // Block keyboard input unless a prompt is waiting for it.
@@ -333,25 +710,88 @@ export function setup() {
           theme: THEMES[activeTheme],
         });
 
-        fitAddon = new window.FitAddon.FitAddon();
+        fitAddon = new bundle.FitAddon.FitAddon();
         terminal.loadAddon(fitAddon);
         terminal.open(host);
         window.addEventListener("resize", onWindowResize);
         terminal.onData(onTerminalData);
         setTimeout(safeFit, 50);
+        // Anything written while the terminal was starting goes out now, before
+        // any later output can overtake it.
+        flushOutput();
+        lastError = "";
         return terminal;
       })
       .catch((err) => {
-        // Allow a later "initialize terminal" block to retry.
-        initPromise = null;
+        // A dispose during startup already cleaned up; leave its state alone.
+        if (attempt !== generation) return null;
+        // A half-built terminal (e.g. open() threw) must not look ready: tear it
+        // down so a later retry starts from a clean page and state.
+        teardownTerminal();
+        lastError = "Could not initialize the terminal: " + errorText(err);
         throw err;
       });
 
     return initPromise;
   }
 
+  // Remove everything the extension added to the page and reset the init state
+  // so `initialize terminal` can build a fresh terminal. Shared by the dispose
+  // block and the runtime's RUNTIME_DISPOSED event.
+  function teardownTerminal() {
+    // Invalidate any init that is still waiting to create its terminal.
+    generation += 1;
+    const oldTerminal = terminal;
+    terminal = null;
+    fitAddon = null;
+    if (oldTerminal) {
+      try {
+        oldTerminal.dispose();
+      } catch (err) {
+        // A terminal that failed to open may still need the rest of the cleanup.
+      }
+    }
+    // Resolve pending prompts (and key reads) rather than leaving threads stuck.
+    cancelPrompts(() => true);
+    cancelKeyReads(() => true);
+    if (resizeObserver) {
+      try {
+        resizeObserver.disconnect();
+      } catch (err) {
+        // Ignore: a fake or already-disconnected observer is harmless.
+      }
+      resizeObserver = null;
+    }
+    window.removeEventListener("resize", onWindowResize);
+    if (container && container.parentNode) {
+      container.parentNode.removeChild(container);
+    }
+    container = null;
+    isVisible = false;
+    // Only undo the stage position we set, and only if nothing changed it since.
+    if (stageElement && stageElement.style.position === "relative") {
+      stageElement.style.position = stagePosition || "";
+    }
+    stageElement = null;
+    stagePosition = null;
+    if (styleElement && styleElement.parentNode) {
+      styleElement.parentNode.removeChild(styleElement);
+    }
+    styleElement = null;
+    initPromise = null;
+  }
+
+  function disposeTerminalState() {
+    teardownTerminal();
+    outputQueue.length = 0;
+    outputChars = 0;
+    pendingLines.length = 0;
+    lastError = "";
+  }
+
   function show() {
-    if (!container || !terminal) return;
+    if (!requireTerminal()) return;
+    if (!container) return;
     container.style.display = "block";
     isVisible = true;
     // Refit on the next frame and once more after the layout has settled,
@@ -364,6 +804,7 @@ export function setup() {
   }
 
   function hide() {
+    if (!requireTerminal()) return;
     if (!container) return;
     container.style.display = "none";
     isVisible = false;
@@ -380,26 +821,55 @@ export function setup() {
 
   function startNextPrompt() {
     if (!terminal) return;
-    const prompt = promptQueue[0];
-    if (!prompt) {
-      setInputEnabled(false);
+    // Lines left over from a paste are consumed here, immediately completing as
+    // many prompts as there are lines for.
+    while (promptQueue.length > 0) {
+      const prompt = promptQueue[0];
+      if (pendingLines.length > 0) {
+        // Pasted lines bypass the per-key editor, so strip control sequences
+        // before they are echoed, remembered or used as the answer.
+        const line = sanitizeLine(pendingLines.shift());
+        terminal.write(prompt.text + line + "\r\n");
+        rememberHistory(line);
+        promptQueue.shift();
+        prompt.resolve(line);
+        continue;
+      }
+      prompt.originRow = promptRow();
+      if (prompt.text) {
+        terminal.write(prompt.text);
+      }
+      setInputEnabled(true);
       return;
     }
-    if (prompt.text) {
-      terminal.write(prompt.text);
-    }
-    setInputEnabled(true);
+    setInputEnabled(false);
   }
 
   function openPrompt(promptText, util) {
-    if (!terminal) {
+    // A prompt with no terminal can never be answered, so resolve it right away
+    // and leave the reason in `last terminal error`.
+    if (!requireTerminal()) {
       return Promise.resolve("");
     }
-    const text = String(promptText === undefined || promptText === null ? "" : promptText);
+    const text = String(
+      promptText === undefined || promptText === null ? "" : promptText,
+    );
     return new Promise((resolve) => {
       // util is only valid during the block's synchronous execution, so the
       // target reference is captured now and never re-read later.
-      promptQueue.push({ text, buffer: "", resolve, target: util ? util.target : null });
+      promptQueue.push({
+        text,
+        // The line is edited as code points, never UTF-16 units, so operations
+        // like backspace cannot split a surrogate pair (emoji included).
+        buffer: [],
+        cursor: 0,
+        // Row the prompt text starts on, used to repaint a wrapped line.
+        originRow: null,
+        historyIndex: null,
+        draft: null,
+        resolve,
+        target: util ? util.target : null,
+      });
       if (promptQueue.length === 1) {
         startNextPrompt();
       }
@@ -430,7 +900,9 @@ export function setup() {
   }
 
   function parseFilter(input) {
-    const text = String(input === undefined || input === null ? "" : input).trim();
+    const text = String(
+      input === undefined || input === null ? "" : input,
+    ).trim();
     if (text === "" || text === "*") return null;
     return text
       .split(",")
@@ -438,42 +910,104 @@ export function setup() {
       .filter((part) => part);
   }
 
-  function writeRaw(text) {
-    if (terminal) {
-      terminal.write(text);
+  function pushOutput(entry) {
+    // Cap a single entry too, otherwise one huge write would exceed the budget.
+    let text = entry.text;
+    if (text.length > OUTPUT_BUFFER_CHARS) {
+      text = text.slice(0, OUTPUT_BUFFER_CHARS) + "…";
     }
+    outputQueue.push({ kind: entry.kind, text });
+    outputChars += text.length;
+    // Keep the newest entries within both the count and the character budget.
+    while (
+      outputQueue.length > OUTPUT_BUFFER_LIMIT ||
+      (outputChars > OUTPUT_BUFFER_CHARS && outputQueue.length > 1)
+    ) {
+      outputChars -= outputQueue.shift().text.length;
+    }
+  }
+
+  function writeOutput(entry) {
+    if (!terminal) {
+      pushOutput(entry);
+      return;
+    }
+    if (entry.kind === "writeln") {
+      terminal.writeln(entry.text);
+    } else {
+      terminal.write(entry.text);
+    }
+  }
+
+  function flushOutput() {
+    if (!terminal) return;
+    while (outputQueue.length > 0) {
+      const entry = outputQueue.shift();
+      outputChars -= entry.text.length;
+      if (entry.kind === "writeln") {
+        terminal.writeln(entry.text);
+      } else {
+        terminal.write(entry.text);
+      }
+    }
+    outputChars = 0;
+  }
+
+  function writeRaw(text) {
+    writeOutput({ kind: "write", text: String(text) });
   }
 
   function writeLine(text) {
-    if (terminal) {
-      terminal.writeln(text);
-    }
+    writeOutput({ kind: "writeln", text: String(text) });
   }
 
-  function log(args) {
-    if (!terminal) return;
+  function formatTimestamp() {
+    if (!timestampsEnabled) return "";
+    if (timestampStyle === "uptime") {
+      const seconds = Math.max(0, Date.now() - projectStartedAt) / 1000;
+      return ANSI.DIM + "[" + seconds.toFixed(4) + "]" + ANSI.RESET + " ";
+    }
+    return ANSI.DIM + new Date().toLocaleTimeString() + ANSI.RESET + " ";
+  }
 
+  function formatLog(args) {
     const levelKey = String(args.LEVEL);
     const scope = String(
       args.SCOPE === undefined || args.SCOPE === null ? "" : args.SCOPE,
     ).trim();
 
-    if (levelFilter && levelFilter.indexOf(levelKey) === -1) return;
-    if (scopeFilter && scopeFilter.indexOf(scope) === -1) return;
+    if (levelFilter && levelFilter.indexOf(levelKey) === -1) return null;
+    if (scopeFilter && scopeFilter.indexOf(scope) === -1) return null;
 
     const config = LEVELS[levelKey] || LEVELS.info;
-    const timestamp = timestampsEnabled
-      ? ANSI.DIM + new Date().toLocaleTimeString() + ANSI.RESET + " "
-      : "";
+    const timestamp = formatTimestamp();
     const label = config.label.padEnd(MAX_LABEL_WIDTH);
-    const prefix = timestamp + config.color + ANSI.BOLD + config.icon + " " + label + ANSI.RESET;
-    const scopeFormat = scope ? ANSI.DIM + "[" + scope + "]" + ANSI.RESET + " " : "";
+    const prefix =
+      timestamp +
+      config.color +
+      ANSI.BOLD +
+      config.icon +
+      " " +
+      label +
+      ANSI.RESET;
+    const scopeFormat = scope
+      ? ANSI.DIM + "[" + scope + "]" + ANSI.RESET + " "
+      : "";
 
-    terminal.writeln(prefix + " " + scopeFormat + String(args.TEXT));
+    return {
+      kind: "writeln",
+      text: prefix + " " + scopeFormat + String(args.TEXT),
+    };
+  }
+
+  function log(args) {
+    const entry = formatLog(args);
+    if (!entry) return;
+    writeOutput(entry);
   }
 
   function drawBox(text) {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
 
     const cols = Math.max(10, terminal.cols || 80);
     const maxInnerWidth = Math.max(1, cols - 4);
@@ -522,13 +1056,13 @@ export function setup() {
   }
 
   function drawRule() {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
     const width = Math.max(1, terminal.cols || 80);
     terminal.writeln(ANSI.DIM + "─".repeat(width) + ANSI.RESET);
   }
 
   function drawRuleLabeled(text) {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
     const label = " " + String(text) + " ";
     const width = Math.max(1, terminal.cols || 80);
 
@@ -539,11 +1073,15 @@ export function setup() {
 
     const left = Math.floor((width - label.length) / 2);
     const right = width - label.length - left;
-    terminal.writeln(ANSI.DIM + "─".repeat(left) + label + "─".repeat(right) + ANSI.RESET);
+    terminal.writeln(
+      ANSI.DIM + "─".repeat(left) + label + "─".repeat(right) + ANSI.RESET,
+    );
   }
 
   function applyTheme(name) {
-    activeTheme = THEMES[String(name).toLowerCase()] ? String(name).toLowerCase() : DEFAULT_THEME;
+    activeTheme = THEMES[String(name).toLowerCase()]
+      ? String(name).toLowerCase()
+      : DEFAULT_THEME;
     if (!terminal) return;
     terminal.options.theme = THEMES[activeTheme];
     if (container) {
@@ -555,17 +1093,35 @@ export function setup() {
   // external stop path in scratch-vm emits one of these two events, so this is
   // what keeps a dead thread from blocking the queue forever.
   const runtime = Scratch.vm && Scratch.vm.runtime;
+  let removeRuntimeListeners = null;
   if (runtime && typeof runtime.on === "function") {
-    const onStopAll = () => cancelPrompts(() => true);
-    const onStopForTarget = (target) =>
+    const onStopAll = () => {
+      // Buffered paste lines belong to the stopped run, not the next one.
+      pendingLines.length = 0;
+      cancelPrompts(() => true);
+      cancelKeyReads(() => true);
+    };
+    const onStopForTarget = (target) => {
       cancelPrompts((prompt) => prompt.target === target);
+      cancelKeyReads((read) => read.target === target);
+    };
+    const onProjectStart = () => {
+      projectStartedAt = Date.now();
+    };
+    const onRuntimeDisposed = () => {
+      disposeTerminalState();
+      if (removeRuntimeListeners) removeRuntimeListeners();
+    };
+    removeRuntimeListeners = () => {
+      if (typeof runtime.removeListener !== "function") return;
+      runtime.removeListener("PROJECT_STOP_ALL", onStopAll);
+      runtime.removeListener("STOP_FOR_TARGET", onStopForTarget);
+      runtime.removeListener("PROJECT_START", onProjectStart);
+      runtime.removeListener("RUNTIME_DISPOSED", onRuntimeDisposed);
+    };
     runtime.on("PROJECT_STOP_ALL", onStopAll);
     runtime.on("STOP_FOR_TARGET", onStopForTarget);
-    runtime.on("RUNTIME_DISPOSED", () => {
-      if (typeof runtime.removeListener === "function") {
-        runtime.removeListener("PROJECT_STOP_ALL", onStopAll);
-        runtime.removeListener("STOP_FOR_TARGET", onStopForTarget);
-      }
-    });
+    runtime.on("PROJECT_START", onProjectStart);
+    runtime.on("RUNTIME_DISPOSED", onRuntimeDisposed);
   }
 }
