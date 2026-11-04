@@ -54,6 +54,9 @@ blocks:
       TEXT:
         type: string
         defaultValue: "Enter command: "
+  - opcode: readKey
+    blockType: reporter
+    text: "read key"
   - opcode: cancelPrompt
     blockType: command
     text: "cancel pending prompts"

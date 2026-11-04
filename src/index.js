@@ -5,6 +5,7 @@ import { clearTerminal } from "./blocks/clearTerminal.js";
 import { terminalReady } from "./blocks/terminalReady.js";
 import { lastTerminalError } from "./blocks/lastTerminalError.js";
 import { promptUser } from "./blocks/promptUser.js";
+import { readKey } from "./blocks/readKey.js";
 import { cancelPrompt } from "./blocks/cancelPrompt.js";
 import { logMessage } from "./blocks/logMessage.js";
 import { setLogLevelFilter } from "./blocks/setLogLevelFilter.js";
@@ -26,6 +27,7 @@ export const blocks = {
   terminalReady,
   lastTerminalError,
   promptUser,
+  readKey,
   cancelPrompt,
   logMessage,
   setLogLevelFilter,
@@ -161,6 +163,7 @@ export function setup() {
 
   const NOT_READY_ERROR = "Terminal is not initialized.";
   const OUTPUT_BUFFER_LIMIT = 1000;
+  const HISTORY_LIMIT = 100;
 
   // scripts/inline-vendor.js replaces this literal with the bundled xterm and
   // xterm-addon-fit builds during `npm run build`, so starting the terminal never
@@ -190,6 +193,11 @@ export function setup() {
   let levelFilter = null;
   let scopeFilter = null;
   const promptQueue = [];
+  const keyQueue = [];
+  // Lines left over from a multi-line paste, handed to the following prompts.
+  const pendingLines = [];
+  // Recently submitted non-empty lines, oldest first, de-duplicated.
+  const history = [];
   // Output produced before the terminal exists is held here as already-formatted
   // entries, so the filters and timestamp style from write time still apply when
   // it is flushed. Bounded so a project that never initializes cannot grow it
@@ -298,26 +306,275 @@ export function setup() {
     }
   }
 
-  function onTerminalData(data) {
-    const prompt = promptQueue[0];
-    if (!prompt || data.startsWith("\x1b")) return;
-    for (const character of data) {
-      if (character === "\r") {
-        terminal.write("\r\n");
-        promptQueue.shift();
-        prompt.resolve(prompt.buffer);
-        startNextPrompt();
-        return;
-      } else if (character === "\x7f") {
-        if (prompt.buffer.length > 0) {
-          prompt.buffer = prompt.buffer.slice(0, -1);
-          terminal.write("\b \b");
-        }
-      } else if (character >= " " && !(character >= "\x80" && character <= "\x9f")) {
-        prompt.buffer += character;
-        terminal.write(character);
+  // Key sequences xterm reports through onData. Longer sequences come first so
+  // "\x1b[3~" is not mistaken for a bare Escape.
+  const KEY_SEQUENCES = [
+    ["\x1b[200~", "PasteStart"],
+    ["\x1b[201~", "PasteEnd"],
+    ["\x1b[1;5C", "CtrlArrowRight"],
+    ["\x1b[1;5D", "CtrlArrowLeft"],
+    ["\x1b[3~", "Delete"],
+    ["\x1b[2~", "Insert"],
+    ["\x1b[5~", "PageUp"],
+    ["\x1b[6~", "PageDown"],
+    ["\x1b[1~", "Home"],
+    ["\x1b[4~", "End"],
+    ["\x1b[7~", "Home"],
+    ["\x1b[8~", "End"],
+    ["\x1b[A", "ArrowUp"],
+    ["\x1b[B", "ArrowDown"],
+    ["\x1b[C", "ArrowRight"],
+    ["\x1b[D", "ArrowLeft"],
+    ["\x1b[H", "Home"],
+    ["\x1b[F", "End"],
+    ["\x1bOH", "Home"],
+    ["\x1bOF", "End"],
+    ["\x1b", "Escape"],
+  ];
+
+  function readEscape(text, start) {
+    for (let i = 0; i < KEY_SEQUENCES.length; i++) {
+      const sequence = KEY_SEQUENCES[i][0];
+      if (text.startsWith(sequence, start)) {
+        return { name: KEY_SEQUENCES[i][1], length: sequence.length };
       }
     }
+    // Unknown CSI sequences are consumed whole so their bytes are never typed
+    // into the line as literal text.
+    const match = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(text.slice(start));
+    if (match) return { name: "", length: match[0].length };
+    return null;
+  }
+
+  function toCodePoints(text) {
+    return Array.from(String(text));
+  }
+
+  function promptValue(prompt) {
+    return prompt.buffer.join("");
+  }
+
+  function rememberHistory(value) {
+    const text = String(value);
+    if (text === "") return;
+    const existing = history.indexOf(text);
+    if (existing !== -1) history.splice(existing, 1);
+    history.push(text);
+    if (history.length > HISTORY_LIMIT) history.shift();
+  }
+
+  function redrawPrompt(prompt) {
+    if (!terminal) return;
+    const before = prompt.buffer.slice(0, prompt.cursor).join("");
+    const after = prompt.buffer.slice(prompt.cursor).join("");
+    // Draw up to the cursor, save it, paint the tail, erase whatever a longer
+    // previous line left behind, then restore the cursor. The save/restore pair
+    // avoids measuring cell widths, which matters for wide characters.
+    terminal.write("\r\x1b[0K" + prompt.text + before);
+    terminal.write("\x1b7");
+    if (after) terminal.write(after);
+    terminal.write("\x1b[0K\x1b8");
+  }
+
+  function setPromptText(prompt, text) {
+    prompt.buffer = toCodePoints(text);
+    prompt.cursor = prompt.buffer.length;
+    redrawPrompt(prompt);
+  }
+
+  function insertPromptText(prompt, text) {
+    const points = toCodePoints(text);
+    if (points.length === 0) return;
+    prompt.buffer = prompt.buffer
+      .slice(0, prompt.cursor)
+      .concat(points, prompt.buffer.slice(prompt.cursor));
+    prompt.cursor += points.length;
+    redrawPrompt(prompt);
+  }
+
+  function deleteBackward(prompt) {
+    if (prompt.cursor === 0) return;
+    prompt.buffer.splice(prompt.cursor - 1, 1);
+    prompt.cursor -= 1;
+    redrawPrompt(prompt);
+  }
+
+  function deleteForward(prompt) {
+    if (prompt.cursor >= prompt.buffer.length) return;
+    prompt.buffer.splice(prompt.cursor, 1);
+    redrawPrompt(prompt);
+  }
+
+  function historyUp(prompt) {
+    if (history.length === 0) return;
+    if (prompt.historyIndex === null) {
+      prompt.draft = prompt.buffer.slice();
+      prompt.historyIndex = history.length - 1;
+    } else if (prompt.historyIndex > 0) {
+      prompt.historyIndex -= 1;
+    } else {
+      return;
+    }
+    setPromptText(prompt, history[prompt.historyIndex]);
+  }
+
+  function historyDown(prompt) {
+    if (prompt.historyIndex === null) return;
+    if (prompt.historyIndex < history.length - 1) {
+      prompt.historyIndex += 1;
+      setPromptText(prompt, history[prompt.historyIndex]);
+      return;
+    }
+    prompt.historyIndex = null;
+    const draft = prompt.draft || [];
+    prompt.draft = null;
+    prompt.buffer = draft;
+    prompt.cursor = draft.length;
+    redrawPrompt(prompt);
+  }
+
+  function submitPrompt(prompt) {
+    if (promptQueue[0] !== prompt) return;
+    const value = promptValue(prompt);
+    terminal.write("\r\n");
+    rememberHistory(value);
+    promptQueue.shift();
+    prompt.resolve(value);
+    startNextPrompt();
+  }
+
+  function cancelActivePrompt() {
+    const prompt = promptQueue[0];
+    if (!prompt) return;
+    terminal.write("^C\r\n");
+    promptQueue.shift();
+    prompt.resolve("");
+    startNextPrompt();
+  }
+
+  function handlePromptKey(prompt, name) {
+    if (name === "ArrowLeft") {
+      if (prompt.cursor > 0) {
+        prompt.cursor -= 1;
+        redrawPrompt(prompt);
+      }
+    } else if (name === "ArrowRight") {
+      if (prompt.cursor < prompt.buffer.length) {
+        prompt.cursor += 1;
+        redrawPrompt(prompt);
+      }
+    } else if (name === "Home") {
+      prompt.cursor = 0;
+      redrawPrompt(prompt);
+    } else if (name === "End") {
+      prompt.cursor = prompt.buffer.length;
+      redrawPrompt(prompt);
+    } else if (name === "Delete") {
+      deleteForward(prompt);
+    } else if (name === "Backspace") {
+      deleteBackward(prompt);
+    } else if (name === "ArrowUp") {
+      historyUp(prompt);
+    } else if (name === "ArrowDown") {
+      historyDown(prompt);
+    }
+  }
+
+  function handlePromptCharacter(prompt, character) {
+    if (character === "\r" || character === "\n") {
+      submitPrompt(prompt);
+    } else if (character === "\x03") {
+      cancelActivePrompt();
+    } else if (character === "\x7f" || character === "\b") {
+      deleteBackward(prompt);
+    } else if (character === "\t") {
+      insertPromptText(prompt, "  ");
+    } else if (character >= " ") {
+      insertPromptText(prompt, character);
+    }
+  }
+
+  function parseInputChunk(text, prompt) {
+    let index = 0;
+    while (index < text.length) {
+      if (text[index] === "\x1b") {
+        const escape = readEscape(text, index);
+        if (escape) {
+          if (escape.name && escape.name !== "PasteStart" && escape.name !== "PasteEnd") {
+            handlePromptKey(prompt, escape.name);
+          }
+          index += escape.length;
+        } else {
+          index += 1;
+        }
+      } else {
+        const character = String.fromCodePoint(text.codePointAt(index));
+        index += character.length;
+        handlePromptCharacter(prompt, character);
+      }
+      // Submitting or cancelling replaces the active prompt; stop feeding it.
+      if (promptQueue[0] !== prompt) return;
+    }
+  }
+
+  function describeKey(data) {
+    if (!data) return "";
+    const escape = readEscape(data, 0);
+    if (escape) return escape.name;
+    const character = String.fromCodePoint(data.codePointAt(0));
+    if (character === "\r" || character === "\n") return "Enter";
+    if (character === "\t") return "Tab";
+    if (character === "\x7f" || character === "\b") return "Backspace";
+    if (character === "\x03") return "Ctrl+C";
+    return character >= " " ? character : "";
+  }
+
+  function handleKeyInput(data) {
+    if (keyQueue.length === 0) return;
+    const name = describeKey(data);
+    if (!name) return;
+    const resolve = keyQueue.shift();
+    resolve(name);
+    if (keyQueue.length === 0 && promptQueue.length === 0) {
+      setInputEnabled(false);
+    }
+  }
+
+  function waitForKey() {
+    if (!requireTerminal()) return "";
+    setInputEnabled(true);
+    return new Promise((resolve) => {
+      keyQueue.push(resolve);
+    });
+  }
+
+  function onTerminalData(data) {
+    // Bracketed paste markers wrap pasted text; they are not part of it.
+    const raw = String(data).replace(/\x1b\[20[01]~/g, "");
+    if (promptQueue.length === 0) {
+      handleKeyInput(raw);
+      return;
+    }
+
+    const prompt = promptQueue[0];
+    if (/\r|\n/.test(raw)) {
+      // A paste with several lines completes this prompt with the first line.
+      // The rest are queued before the submit so a prompt that is already
+      // waiting consumes them in order instead of losing them.
+      const lines = raw.split(/\r\n|\r|\n/);
+      const rest = lines.slice(1);
+      if (rest.length > 0 && rest[rest.length - 1] === "") rest.pop();
+      for (let i = 0; i < rest.length; i++) {
+        pendingLines.push(rest[i]);
+      }
+      parseInputChunk(lines[0], prompt);
+      if (promptQueue[0] === prompt) {
+        submitPrompt(prompt);
+      }
+      return;
+    }
+
+    parseInputChunk(raw, prompt);
   }
 
   function init() {
@@ -401,15 +658,25 @@ export function setup() {
 
   function startNextPrompt() {
     if (!terminal) return;
-    const prompt = promptQueue[0];
-    if (!prompt) {
-      setInputEnabled(false);
+    // Lines left over from a paste are consumed here, immediately completing as
+    // many prompts as there are lines for.
+    while (promptQueue.length > 0) {
+      const prompt = promptQueue[0];
+      if (pendingLines.length > 0) {
+        const line = pendingLines.shift();
+        terminal.write(prompt.text + line + "\r\n");
+        rememberHistory(line);
+        promptQueue.shift();
+        prompt.resolve(line);
+        continue;
+      }
+      if (prompt.text) {
+        terminal.write(prompt.text);
+      }
+      setInputEnabled(true);
       return;
     }
-    if (prompt.text) {
-      terminal.write(prompt.text);
-    }
-    setInputEnabled(true);
+    setInputEnabled(false);
   }
 
   function openPrompt(promptText, util) {
@@ -422,7 +689,17 @@ export function setup() {
     return new Promise((resolve) => {
       // util is only valid during the block's synchronous execution, so the
       // target reference is captured now and never re-read later.
-      promptQueue.push({ text, buffer: "", resolve, target: util ? util.target : null });
+      promptQueue.push({
+        text,
+        // The line is edited as code points, never UTF-16 units, so operations
+        // like backspace cannot split a surrogate pair (emoji included).
+        buffer: [],
+        cursor: 0,
+        historyIndex: null,
+        draft: null,
+        resolve,
+        target: util ? util.target : null,
+      });
       if (promptQueue.length === 1) {
         startNextPrompt();
       }
