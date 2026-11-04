@@ -80,17 +80,27 @@ test("the pre-init output buffer keeps only the newest 1000 entries", async (t) 
   assert.ok(output.includes("line-1004\r\n"));
 });
 
-test("uptime timestamps bracket seconds since the project started", async (t) => {
-  const harness = setup(t);
+test("uptime timestamps count from project start and restart on PROJECT_START", async (t) => {
+  let now = 500000;
+  const harness = await createReadyHarness(t, { now: () => now });
   const { extension } = harness;
+  t.after(() => {
+    harness.window.Date.now = harness.realDateNow;
+  });
 
   extension.setTimestampStyle({ STYLE: "uptime" });
   extension.setTimestamps({ STATE: "on" });
-  extension.logMessage({ LEVEL: "info", SCOPE: "", TEXT: "uptime hello" });
 
-  await extension.initializeTerminal();
+  now = 502500;
+  extension.logMessage({ LEVEL: "info", SCOPE: "", TEXT: "uptime-one" });
 
-  assert.match(harness.output(), /\[\d+\.\d{4}\][\s\S]*uptime hello/);
+  harness.runtime.emit("PROJECT_START");
+  now = 502600;
+  extension.logMessage({ LEVEL: "info", SCOPE: "", TEXT: "uptime-two" });
+
+  const output = harness.output();
+  assert.match(output, /\[2\.5000\][\s\S]*uptime-one/);
+  assert.match(output, /\[0\.1000\][\s\S]*uptime-two/);
 });
 
 test("clock style still renders a wall-clock timestamp", async (t) => {
@@ -124,6 +134,7 @@ test("dispose removes everything it added and allows a fresh initialize", async 
 
   assert.ok(harness.document.getElementById("xterm-twext-container"));
   assert.ok(harness.document.getElementById("xterm-twext-css"));
+  assert.equal(harness.stage.style.position, "relative");
 
   extension.disposeTerminal();
 
@@ -133,6 +144,7 @@ test("dispose removes everything it added and allows a fresh initialize", async 
   assert.equal(harness.resizeRemoves.length, 1);
   assert.equal(harness.document.getElementById("xterm-twext-container"), null);
   assert.equal(harness.document.getElementById("xterm-twext-css"), null);
+  assert.equal(harness.stage.style.position, "");
   assert.equal(extension.terminalReady(), false);
   assert.equal(harness.resizeObservers.length, 1);
 
@@ -156,4 +168,86 @@ test("RUNTIME_DISPOSED runs the same cleanup and forgets its own listeners", asy
   assert.equal(harness.runtime.count("RUNTIME_DISPOSED"), 0);
   assert.equal(harness.runtime.count("PROJECT_START"), 0);
   assert.equal(harness.runtime.count("PROJECT_STOP_ALL"), 0);
+});
+
+test("a failed open tears down the half-built terminal so a retry starts clean", async (t) => {
+  const harness = setup(t, { failOpen: "open exploded", failOpenTimes: 1 });
+  const { extension } = harness;
+
+  await extension.initializeTerminal();
+
+  assert.equal(extension.terminalReady(), false);
+  assert.match(extension.lastTerminalError(), /open exploded/);
+  assert.equal(harness.terminals.length, 1);
+  assert.equal(harness.terminals[0].disposed, true);
+  assert.equal(harness.document.getElementById("xterm-twext-container"), null);
+  assert.equal(harness.document.getElementById("xterm-twext-css"), null);
+
+  await extension.initializeTerminal();
+
+  assert.equal(extension.terminalReady(), true);
+  assert.equal(extension.lastTerminalError(), "");
+  assert.equal(harness.terminals.length, 2);
+  assert.ok(harness.document.getElementById("xterm-twext-container"));
+});
+
+test("dispose during startup leaves no terminal behind", async (t) => {
+  const harness = setup(t);
+  const { extension } = harness;
+
+  const starting = extension.initializeTerminal();
+  extension.disposeTerminal();
+  await starting;
+
+  assert.equal(harness.terminals.length, 0);
+  assert.equal(extension.terminalReady(), false);
+  assert.equal(harness.document.getElementById("xterm-twext-container"), null);
+
+  await extension.initializeTerminal();
+
+  assert.equal(extension.terminalReady(), true);
+  assert.equal(harness.terminals.length, 1);
+});
+
+test("an oversized pre-init write is truncated to the character budget", async (t) => {
+  const harness = setup(t);
+
+  harness.extension.writeToTerminal({ TEXT: "x".repeat(250000) });
+  await harness.extension.initializeTerminal();
+
+  // 100000 characters plus the truncation marker.
+  assert.equal(harness.output().length, 100001);
+  assert.ok(harness.output().startsWith("x"));
+});
+
+test("the pre-init queue bounds the total retained text, not just the entry count", async (t) => {
+  const harness = setup(t);
+
+  for (let i = 0; i < 40; i++) {
+    harness.extension.writeLineToTerminal({
+      TEXT: `line-${i}:` + "y".repeat(5000),
+    });
+  }
+  await harness.extension.initializeTerminal();
+  const output = harness.output();
+
+  // 100000 characters of text, plus one "\r\n" per retained entry.
+  assert.ok(output.length <= 100000 + 2 * 1000, output.length);
+  assert.ok(output.includes("line-39:"));
+  assert.ok(!output.includes("line-0:"));
+});
+
+test("the real inlined xterm bundle initializes without the test seam", async (t) => {
+  const harness = await createReadyHarness(t, { useRealVendor: true });
+  const { extension } = harness;
+
+  assert.equal(extension.terminalReady(), true);
+  assert.equal(extension.lastTerminalError(), "");
+  assert.ok(harness.document.getElementById("xterm-twext-container"));
+  assert.ok(harness.document.getElementById("xterm-twext-css"));
+  assert.ok(extension.terminalColumns() > 0);
+  assert.ok(extension.terminalRows() > 0);
+
+  extension.writeLineToTerminal({ TEXT: "real bundle output" });
+  assert.equal(extension.lastTerminalError(), "");
 });

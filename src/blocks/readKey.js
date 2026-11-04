@@ -1,3 +1,3 @@
-export function readKey() {
-  return waitForKey();
+export function readKey(args, util) {
+  return waitForKey(util);
 }

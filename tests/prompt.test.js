@@ -165,3 +165,89 @@ test("read key records the not-initialized error instead of hanging", async (t) 
   assert.equal(await harness.extension.readKey(), "");
   assert.equal(harness.extension.lastTerminalError(), "Terminal is not initialized.");
 });
+
+test("STOP_FOR_TARGET cancels that target's key read only", async (t) => {
+  const harness = await createReadyHarness(t);
+  const terminal = harness.lastTerminal();
+  const firstTarget = { id: "first" };
+  const secondTarget = { id: "second" };
+
+  const first = harness.extension.readKey({}, { target: firstTarget });
+  const second = harness.extension.readKey({}, { target: secondTarget });
+
+  harness.runtime.emit("STOP_FOR_TARGET", firstTarget);
+  assert.equal(await first, "");
+
+  // The stopped read must not consume the keypress meant for the live one.
+  terminal.emitData("k");
+  assert.equal(await second, "k");
+});
+
+test("PROJECT_STOP_ALL drops queued paste lines and pending key reads", async (t) => {
+  const harness = await createReadyHarness(t);
+  const terminal = harness.lastTerminal();
+  const { extension } = harness;
+
+  const first = extension.promptUser({ TEXT: "> " });
+  const second = extension.promptUser({ TEXT: "> " });
+  terminal.emitData("one\ntwo\nthree");
+  assert.equal(await first, "one");
+  assert.equal(await second, "two");
+
+  const stopped = extension.readKey({}, { target: {} });
+  harness.runtime.emit("PROJECT_STOP_ALL");
+  assert.equal(await stopped, "");
+
+  // "three" belonged to the stopped run and must not answer this prompt.
+  const next = extension.promptUser({ TEXT: "> " });
+  terminal.emitData("final" + ENTER);
+  assert.equal(await next, "final");
+});
+
+test("pasted lines are stripped of terminal control sequences", async (t) => {
+  const harness = await createReadyHarness(t);
+  const terminal = harness.lastTerminal();
+
+  const first = harness.extension.promptUser({ TEXT: "> " });
+  terminal.emitData("one\nclean\x1b[2Jline");
+  assert.equal(await first, "one");
+
+  const second = harness.extension.promptUser({ TEXT: "> " });
+  assert.equal(await second, "cleanline");
+  assert.ok(!harness.output().includes("\x1b[2J"));
+});
+
+test("an unlisted CSI sequence is ignored instead of typed as text", async (t) => {
+  const harness = await createReadyHarness(t);
+  const terminal = harness.lastTerminal();
+  const { extension } = harness;
+
+  const answer = extension.promptUser({ TEXT: "> " });
+  terminal.emitData("\x1b[99X");
+  terminal.emitData("ok");
+  terminal.emitData(ENTER);
+  assert.equal(await answer, "ok");
+
+  // A read waits through the unknown sequence for a real keypress.
+  const read = extension.readKey({}, { target: {} });
+  terminal.emitData("\x1b[99X");
+  terminal.emitData("z");
+  assert.equal(await read, "z");
+});
+
+test("a wrapped prompt is repainted from its first row", async (t) => {
+  const harness = await createReadyHarness(t);
+  const terminal = harness.lastTerminal();
+  terminal.cols = 6;
+
+  const answer = harness.extension.promptUser({ TEXT: "> " });
+  terminal.emitData("abcdef");
+  terminal.emitData(LEFT);
+  terminal.emitData(BACKSPACE);
+  terminal.emitData(ENTER);
+
+  assert.equal(await answer, "abcdf");
+  assert.ok(harness.output().includes("\x1b[1A"));
+  assert.ok(harness.output().includes("\x1b[0J"));
+  assert.ok(harness.output().includes("> abcd"));
+});

@@ -171,6 +171,9 @@ export function setup() {
 
   const NOT_READY_ERROR = "Terminal is not initialized.";
   const OUTPUT_BUFFER_LIMIT = 1000;
+  // Total text retained before the terminal exists. The entry limit alone would
+  // let one huge write hold an unbounded string.
+  const OUTPUT_BUFFER_CHARS = 100000;
   const HISTORY_LIMIT = 100;
 
   // scripts/inline-vendor.js replaces this literal with the bundled xterm and
@@ -192,9 +195,14 @@ export function setup() {
   let fitAddon = null;
   let resizeObserver = null;
   let initPromise = null;
+  // Bumped by teardown so a deferred terminal creation from an earlier init
+  // cannot install a terminal after the extension was disposed.
+  let generation = 0;
   let isVisible = false;
   let vendor = null;
   let styleElement = null;
+  let stageElement = null;
+  let stagePosition = null;
 
   let lastError = "";
   let activeTheme = DEFAULT_THEME;
@@ -218,6 +226,9 @@ export function setup() {
   // it is flushed. Bounded so a project that never initializes cannot grow it
   // without limit; the oldest entry is dropped first.
   const outputQueue = [];
+  // Total retained text across outputQueue entries, so the character budget
+  // above is enforced without walking the queue on every write.
+  let outputChars = 0;
 
   function errorText(err) {
     if (err && err.message) return String(err.message);
@@ -304,6 +315,9 @@ export function setup() {
     container.style.overflow = "hidden";
 
     if (getComputedStyle(stage).position === "static") {
+      // Remember the original value so teardown can undo this change.
+      stageElement = stage;
+      stagePosition = stage.style.position;
       stage.style.position = "relative";
     }
     stage.appendChild(container);
@@ -354,6 +368,10 @@ export function setup() {
   function readEscape(text, start) {
     for (let i = 0; i < KEY_SEQUENCES.length; i++) {
       const sequence = KEY_SEQUENCES[i][0];
+      // The bare escape is only the last resort, after whole CSI sequences have
+      // been tried, otherwise an unlisted "\x1b[..." would be read as Escape
+      // followed by literal text.
+      if (sequence === "\x1b") continue;
       if (text.startsWith(sequence, start)) {
         return { name: KEY_SEQUENCES[i][1], length: sequence.length };
       }
@@ -362,11 +380,31 @@ export function setup() {
     // into the line as literal text.
     const match = /^\x1b\[[0-9;]*[A-Za-z~]/.exec(text.slice(start));
     if (match) return { name: "", length: match[0].length };
+    // Anything else that starts with an escape is a lone Escape keypress.
+    if (text.startsWith("\x1b", start)) return { name: "Escape", length: 1 };
     return null;
   }
 
   function toCodePoints(text) {
     return Array.from(String(text));
+  }
+
+  // Pasted lines never go through the key parser, so whole escape sequences are
+  // dropped first (an ESC alone would leave their parameters behind), then any
+  // remaining C0/C1 control characters, matching how typed input is filtered.
+  function sanitizeLine(text) {
+    return String(text)
+      .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, "")
+      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "")
+      .replace(/\x1b[@-_]/g, "")
+      .replace(/[\u0000-\u001f\u007f-\u009f]/g, "");
+  }
+
+  // Row of the live cursor, used to repaint a wrapped prompt from its origin.
+  function promptRow() {
+    const active = terminal && terminal.buffer && terminal.buffer.active;
+    if (!active) return null;
+    return active.baseY + active.cursorY;
   }
 
   function promptValue(prompt) {
@@ -386,10 +424,27 @@ export function setup() {
     if (!terminal) return;
     const before = prompt.buffer.slice(0, prompt.cursor).join("");
     const after = prompt.buffer.slice(prompt.cursor).join("");
-    // Draw up to the cursor, save it, paint the tail, erase whatever a longer
-    // previous line left behind, then restore the cursor. The save/restore pair
-    // avoids measuring cell widths, which matters for wide characters.
-    terminal.write("\r\x1b[0K" + prompt.text + before);
+    // Repaint from the prompt's first row, not just the caret's row, so a line
+    // that wrapped leaves no stale cells behind. xterm exposes the live cursor
+    // row, so the origin recorded when the prompt was painted says how far up
+    // the first row is.
+    const row = promptRow();
+    let rowsUp = 0;
+    if (row !== null) {
+      if (prompt.originRow !== null && prompt.originRow !== undefined) {
+        rowsUp = Math.max(0, row - prompt.originRow);
+      }
+    } else {
+      // No buffer (test doubles): a submitted line always ends with a newline,
+      // so the prompt starts at column 0 and its width gives the row count.
+      const width = Math.max(1, terminal.cols || 80);
+      rowsUp = Math.floor((prompt.text.length + before.length) / width);
+    }
+    terminal.write("\r");
+    if (rowsUp > 0) terminal.write("\x1b[" + rowsUp + "A");
+    // Erase the whole prompt (all its wrapped rows), then draw it again from the
+    // origin, saving/restoring the cursor instead of measuring cell widths.
+    terminal.write("\x1b[0J" + prompt.text + before);
     terminal.write("\x1b7");
     if (after) terminal.write(after);
     terminal.write("\x1b[0K\x1b8");
@@ -556,19 +611,43 @@ export function setup() {
     if (keyQueue.length === 0) return;
     const name = describeKey(data);
     if (!name) return;
-    const resolve = keyQueue.shift();
-    resolve(name);
+    const entry = keyQueue.shift();
+    entry.resolve(name);
     if (keyQueue.length === 0 && promptQueue.length === 0) {
       setInputEnabled(false);
     }
   }
 
-  function waitForKey() {
+  function waitForKey(util) {
     if (!requireTerminal()) return "";
     setInputEnabled(true);
     return new Promise((resolve) => {
-      keyQueue.push(resolve);
+      // util is only valid during the block's synchronous execution, so capture
+      // the target now: a stop event must cancel exactly this read.
+      keyQueue.push({ resolve, target: util ? util.target : null });
     });
+  }
+
+  // Resolve reads whose thread was stopped, so they cannot swallow a later
+  // keypress meant for the next run.
+  function cancelKeyReads(match) {
+    if (keyQueue.length === 0) return;
+    const kept = [];
+    for (let i = 0; i < keyQueue.length; i++) {
+      const entry = keyQueue[i];
+      if (match(entry)) {
+        entry.resolve("");
+      } else {
+        kept.push(entry);
+      }
+    }
+    keyQueue.length = 0;
+    for (let i = 0; i < kept.length; i++) {
+      keyQueue.push(kept[i]);
+    }
+    if (keyQueue.length === 0 && promptQueue.length === 0) {
+      setInputEnabled(false);
+    }
   }
 
   function onTerminalData(data) {
@@ -606,8 +685,13 @@ export function setup() {
     // cannot both build a terminal.
     if (initPromise) return initPromise;
 
+    // A dispose can land before the deferred creation below runs; this records
+    // which attempt is allowed to install a terminal.
+    const attempt = generation;
+
     initPromise = Promise.resolve()
       .then(() => {
+        if (attempt !== generation) return null;
         injectStyles();
         const host = ensureContainer();
         if (!host) {
@@ -639,9 +723,11 @@ export function setup() {
         return terminal;
       })
       .catch((err) => {
-        // Allow a later "initialize terminal" block to retry, and keep the
-        // reason so `last terminal error` can explain the silence.
-        initPromise = null;
+        // A dispose during startup already cleaned up; leave its state alone.
+        if (attempt !== generation) return null;
+        // A half-built terminal (e.g. open() threw) must not look ready: tear it
+        // down so a later retry starts from a clean page and state.
+        teardownTerminal();
         lastError = "Could not initialize the terminal: " + errorText(err);
         throw err;
       });
@@ -653,6 +739,8 @@ export function setup() {
   // so `initialize terminal` can build a fresh terminal. Shared by the dispose
   // block and the runtime's RUNTIME_DISPOSED event.
   function teardownTerminal() {
+    // Invalidate any init that is still waiting to create its terminal.
+    generation += 1;
     const oldTerminal = terminal;
     terminal = null;
     fitAddon = null;
@@ -665,10 +753,7 @@ export function setup() {
     }
     // Resolve pending prompts (and key reads) rather than leaving threads stuck.
     cancelPrompts(() => true);
-    while (keyQueue.length > 0) {
-      const resolve = keyQueue.shift();
-      resolve("");
-    }
+    cancelKeyReads(() => true);
     if (resizeObserver) {
       try {
         resizeObserver.disconnect();
@@ -683,6 +768,12 @@ export function setup() {
     }
     container = null;
     isVisible = false;
+    // Only undo the stage position we set, and only if nothing changed it since.
+    if (stageElement && stageElement.style.position === "relative") {
+      stageElement.style.position = stagePosition || "";
+    }
+    stageElement = null;
+    stagePosition = null;
     if (styleElement && styleElement.parentNode) {
       styleElement.parentNode.removeChild(styleElement);
     }
@@ -693,6 +784,7 @@ export function setup() {
   function disposeTerminalState() {
     teardownTerminal();
     outputQueue.length = 0;
+    outputChars = 0;
     pendingLines.length = 0;
     lastError = "";
   }
@@ -734,13 +826,16 @@ export function setup() {
     while (promptQueue.length > 0) {
       const prompt = promptQueue[0];
       if (pendingLines.length > 0) {
-        const line = pendingLines.shift();
+        // Pasted lines bypass the per-key editor, so strip control sequences
+        // before they are echoed, remembered or used as the answer.
+        const line = sanitizeLine(pendingLines.shift());
         terminal.write(prompt.text + line + "\r\n");
         rememberHistory(line);
         promptQueue.shift();
         prompt.resolve(line);
         continue;
       }
+      prompt.originRow = promptRow();
       if (prompt.text) {
         terminal.write(prompt.text);
       }
@@ -768,6 +863,8 @@ export function setup() {
         // like backspace cannot split a surrogate pair (emoji included).
         buffer: [],
         cursor: 0,
+        // Row the prompt text starts on, used to repaint a wrapped line.
+        originRow: null,
         historyIndex: null,
         draft: null,
         resolve,
@@ -814,9 +911,19 @@ export function setup() {
   }
 
   function pushOutput(entry) {
-    outputQueue.push(entry);
-    if (outputQueue.length > OUTPUT_BUFFER_LIMIT) {
-      outputQueue.shift();
+    // Cap a single entry too, otherwise one huge write would exceed the budget.
+    let text = entry.text;
+    if (text.length > OUTPUT_BUFFER_CHARS) {
+      text = text.slice(0, OUTPUT_BUFFER_CHARS) + "…";
+    }
+    outputQueue.push({ kind: entry.kind, text });
+    outputChars += text.length;
+    // Keep the newest entries within both the count and the character budget.
+    while (
+      outputQueue.length > OUTPUT_BUFFER_LIMIT ||
+      (outputChars > OUTPUT_BUFFER_CHARS && outputQueue.length > 1)
+    ) {
+      outputChars -= outputQueue.shift().text.length;
     }
   }
 
@@ -836,12 +943,14 @@ export function setup() {
     if (!terminal) return;
     while (outputQueue.length > 0) {
       const entry = outputQueue.shift();
+      outputChars -= entry.text.length;
       if (entry.kind === "writeln") {
         terminal.writeln(entry.text);
       } else {
         terminal.write(entry.text);
       }
     }
+    outputChars = 0;
   }
 
   function writeRaw(text) {
@@ -986,9 +1095,16 @@ export function setup() {
   const runtime = Scratch.vm && Scratch.vm.runtime;
   let removeRuntimeListeners = null;
   if (runtime && typeof runtime.on === "function") {
-    const onStopAll = () => cancelPrompts(() => true);
-    const onStopForTarget = (target) =>
+    const onStopAll = () => {
+      // Buffered paste lines belong to the stopped run, not the next one.
+      pendingLines.length = 0;
+      cancelPrompts(() => true);
+      cancelKeyReads(() => true);
+    };
+    const onStopForTarget = (target) => {
       cancelPrompts((prompt) => prompt.target === target);
+      cancelKeyReads((read) => read.target === target);
+    };
     const onProjectStart = () => {
       projectStartedAt = Date.now();
     };

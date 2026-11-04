@@ -130,31 +130,97 @@ const ARGUMENT_TYPES = {
 };
 
 /**
+ * xterm needs matchMedia and a canvas 2D context to open. jsdom has neither, so
+ * the context is a permissive stub: xterm only needs the calls to exist, and the
+ * test using this path asserts construction, not rendered pixels.
+ */
+function installBrowserStubs(window) {
+  window.matchMedia = (media) => ({
+    matches: false,
+    media,
+    onchange: null,
+    addEventListener() {},
+    removeEventListener() {},
+    addListener() {},
+    removeListener() {},
+  });
+  const context = new Proxy(
+    {
+      measureText: () => ({ width: 8 }),
+      createLinearGradient: () => ({ addColorStop() {} }),
+      getImageData: () => ({ data: new Uint8ClampedArray(4) }),
+      createImageData: () => ({ data: new Uint8ClampedArray(4) }),
+    },
+    {
+      get(target, key) {
+        return key in target ? target[key] : () => {};
+      },
+      set() {
+        return true;
+      },
+    },
+  );
+  window.HTMLCanvasElement.prototype.getContext = function () {
+    context.canvas = this;
+    return context;
+  };
+}
+
+/**
  * Load the built extension in a jsdom window. A fake Terminal (and fit addon) is
  * installed through the extension's test seam, so the real 280 kB xterm bundle
  * is present in the file but never evaluated by these tests.
  *
- * `failInit` makes the fake Terminal constructor throw, which is how the init
- * failure path is exercised.
+ * `failInit` makes the fake Terminal constructor throw, and `failOpen` makes
+ * `open()` throw, which is how the init failure paths are exercised; the
+ * `*Times` options allow the failure to be one-shot so a retry can succeed.
+ * `useRealVendor` skips the seam and evaluates the inlined xterm bundle for
+ * real. `now` fixes the clock before setup runs, so uptime is deterministic.
  */
-export function createHarness({ failInit = null } = {}) {
+export function createHarness({
+  failInit = null,
+  failInitTimes = Infinity,
+  failOpen = null,
+  failOpenTimes = Infinity,
+  useRealVendor = false,
+  now = null,
+} = {}) {
   const dom = new JSDOM(
     '<!doctype html><html><body><div id="stage"><canvas id="stage-canvas"></canvas></div></body></html>',
     { runScripts: "outside-only", pretendToBeVisual: true },
   );
   const { window } = dom;
   const document = window.document;
+  const realDateNow = window.Date.now;
+
+  if (now) {
+    window.Date.now = () => now();
+  }
 
   const terminals = [];
   const resizeObservers = [];
   const resizeAdds = [];
   const resizeRemoves = [];
 
+  let initFailures = failInit ? failInitTimes : 0;
+  let openFailures = failOpen ? failOpenTimes : 0;
+
   class TestTerminal extends FakeTerminal {
     constructor(options) {
-      if (failInit) throw new Error(failInit);
+      if (initFailures > 0) {
+        initFailures -= 1;
+        throw new Error(failInit);
+      }
       super(options);
       terminals.push(this);
+    }
+
+    open(host) {
+      if (openFailures > 0) {
+        openFailures -= 1;
+        throw new Error(failOpen);
+      }
+      super.open(host);
     }
   }
 
@@ -205,11 +271,15 @@ export function createHarness({ failInit = null } = {}) {
     vm: { runtime },
   };
 
-  window.__XTERM_TEST_VENDOR__ = {
-    Terminal: TestTerminal,
-    FitAddon: { FitAddon: FakeFitAddon },
-    css: ".xterm-test { color: inherit; }",
-  };
+  if (useRealVendor) {
+    installBrowserStubs(window);
+  } else {
+    window.__XTERM_TEST_VENDOR__ = {
+      Terminal: TestTerminal,
+      FitAddon: { FitAddon: FakeFitAddon },
+      css: ".xterm-test { color: inherit; }",
+    };
+  }
 
   window.eval(readFileSync(BUNDLE_PATH, "utf8"));
 
@@ -221,6 +291,8 @@ export function createHarness({ failInit = null } = {}) {
     resizeObservers,
     resizeAdds,
     resizeRemoves,
+    realDateNow,
+    stage: document.getElementById("stage"),
     get extension() {
       return extension;
     },
@@ -237,7 +309,7 @@ export function createHarness({ failInit = null } = {}) {
   };
 }
 
-/** Load the extension, initialize the fake terminal and return the harness. */
+/** Load the extension, initialize the terminal and return the harness. */
 export async function createReadyHarness(t, options) {
   const harness = createHarness(options);
   t.after(() => harness.close());
