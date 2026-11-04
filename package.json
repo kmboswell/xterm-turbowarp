@@ -7,7 +7,8 @@
   "type": "module",
   "scripts": {
     "validate": "extend validate",
-    "build": "extend build && node scripts/inline-vendor.js"
+    "build": "extend build && node scripts/inline-vendor.js",
+    "test": "npm run build && node --test \"tests/*.test.js\""
   },
   "devDependencies": {
     "@triflare/extend": "^0.2.0",

@@ -1,0 +1,246 @@
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { JSDOM } from "jsdom";
+
+const BUNDLE_PATH = fileURLToPath(new URL("../dist/extension.js", import.meta.url));
+
+export class FakeTerminal {
+  constructor(options = {}) {
+    this.options = { ...options };
+    this.cols = 80;
+    this.rows = 24;
+    this.output = [];
+    this.dataHandlers = [];
+    this.addons = [];
+    this.disposed = false;
+    this.cleared = false;
+    this.focusCount = 0;
+    this.host = null;
+  }
+
+  open(host) {
+    this.host = host;
+  }
+
+  loadAddon(addon) {
+    this.addons.push(addon);
+  }
+
+  onData(handler) {
+    this.dataHandlers.push(handler);
+    return { dispose() {} };
+  }
+
+  write(text) {
+    this.output.push(String(text));
+  }
+
+  writeln(text) {
+    this.output.push(String(text) + "\r\n");
+  }
+
+  clear() {
+    this.cleared = true;
+  }
+
+  focus() {
+    this.focusCount += 1;
+  }
+
+  dispose() {
+    this.disposed = true;
+  }
+
+  emitData(data) {
+    for (const handler of [...this.dataHandlers]) {
+      handler(data);
+    }
+  }
+
+  text() {
+    return this.output.join("");
+  }
+}
+
+export class FakeFitAddon {
+  constructor() {
+    this.fitCount = 0;
+  }
+
+  proposeDimensions() {
+    return { cols: 80, rows: 24 };
+  }
+
+  fit() {
+    this.fitCount += 1;
+  }
+}
+
+export class FakeRuntime {
+  constructor() {
+    this.listeners = new Map();
+  }
+
+  on(event, handler) {
+    const handlers = this.listeners.get(event) ?? [];
+    handlers.push(handler);
+    this.listeners.set(event, handlers);
+  }
+
+  removeListener(event, handler) {
+    const handlers = this.listeners.get(event) ?? [];
+    this.listeners.set(
+      event,
+      handlers.filter((candidate) => candidate !== handler),
+    );
+  }
+
+  emit(event, ...args) {
+    for (const handler of [...(this.listeners.get(event) ?? [])]) {
+      handler(...args);
+    }
+  }
+
+  count(event) {
+    return (this.listeners.get(event) ?? []).length;
+  }
+}
+
+const BLOCK_TYPES = {
+  COMMAND: "command",
+  REPORTER: "reporter",
+  BOOLEAN: "boolean",
+  HAT: "hat",
+  EVENT: "event",
+  LOOP: "loop",
+  CONDITIONAL: "conditional",
+};
+
+const ARGUMENT_TYPES = {
+  STRING: "string",
+  NUMBER: "number",
+  BOOLEAN: "boolean",
+  ANGLE: "angle",
+  COLOR: "color",
+  MATRIX: "matrix",
+  NOTE: "note",
+  IMAGE: "image",
+  COSTUME: "costume",
+  SOUND: "sound",
+};
+
+/**
+ * Load the built extension in a jsdom window. A fake Terminal (and fit addon) is
+ * installed through the extension's test seam, so the real 280 kB xterm bundle
+ * is present in the file but never evaluated by these tests.
+ *
+ * `failInit` makes the fake Terminal constructor throw, which is how the init
+ * failure path is exercised.
+ */
+export function createHarness({ failInit = null } = {}) {
+  const dom = new JSDOM(
+    '<!doctype html><html><body><div id="stage"><canvas id="stage-canvas"></canvas></div></body></html>',
+    { runScripts: "outside-only", pretendToBeVisual: true },
+  );
+  const { window } = dom;
+  const document = window.document;
+
+  const terminals = [];
+  const resizeObservers = [];
+  const resizeAdds = [];
+  const resizeRemoves = [];
+
+  class TestTerminal extends FakeTerminal {
+    constructor(options) {
+      if (failInit) throw new Error(failInit);
+      super(options);
+      terminals.push(this);
+    }
+  }
+
+  window.ResizeObserver = class {
+    constructor(callback) {
+      this.callback = callback;
+      this.disconnected = false;
+      resizeObservers.push(this);
+    }
+
+    observe() {}
+
+    disconnect() {
+      this.disconnected = true;
+    }
+  };
+
+  window.requestAnimationFrame = (callback) => {
+    callback(0);
+    return 1;
+  };
+  window.cancelAnimationFrame = () => {};
+
+  const addEventListener = window.addEventListener.bind(window);
+  const removeEventListener = window.removeEventListener.bind(window);
+  window.addEventListener = (type, listener, options) => {
+    if (type === "resize") resizeAdds.push(listener);
+    addEventListener(type, listener, options);
+  };
+  window.removeEventListener = (type, listener, options) => {
+    if (type === "resize") resizeRemoves.push(listener);
+    removeEventListener(type, listener, options);
+  };
+
+  const runtime = new FakeRuntime();
+  runtime.renderer = { canvas: document.getElementById("stage-canvas") };
+
+  let extension = null;
+  window.Scratch = {
+    BlockType: BLOCK_TYPES,
+    ArgumentType: ARGUMENT_TYPES,
+    extensions: {
+      unsandboxed: true,
+      register: (registered) => {
+        extension = registered;
+      },
+    },
+    vm: { runtime },
+  };
+
+  window.__XTERM_TEST_VENDOR__ = {
+    Terminal: TestTerminal,
+    FitAddon: { FitAddon: FakeFitAddon },
+    css: ".xterm-test { color: inherit; }",
+  };
+
+  window.eval(readFileSync(BUNDLE_PATH, "utf8"));
+
+  return {
+    window,
+    document,
+    runtime,
+    terminals,
+    resizeObservers,
+    resizeAdds,
+    resizeRemoves,
+    get extension() {
+      return extension;
+    },
+    lastTerminal() {
+      return terminals.length > 0 ? terminals[terminals.length - 1] : null;
+    },
+    output() {
+      const terminal = this.lastTerminal();
+      return terminal ? terminal.text() : "";
+    },
+    close() {
+      window.close();
+    },
+  };
+}
+
+/** Load the extension, initialize the fake terminal and return the harness. */
+export async function createReadyHarness(t, options) {
+  const harness = createHarness(options);
+  t.after(() => harness.close());
+  await harness.extension.initializeTerminal();
+  return harness;
+}
