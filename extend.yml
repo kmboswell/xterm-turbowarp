@@ -1,6 +1,6 @@
 name: "Xterm"
-version: "0.1.2"
-description: "A terminal emulator overlay for the stage, powered by xterm.js."
+version: "1.0.0"
+description: "Xterm, for TurboWarp."
 author: "Kamix Fox"
 license: "Apache-2.0"
 
@@ -19,7 +19,8 @@ extension:
       items: ["atom-one-dark", "atom-one-light", "dracula", "solarized"]
     levels:
       acceptReporters: true
-      items: ["info", "success", "warn", "error", "debug", "start", "trace", "fatal"]
+      items:
+        ["info", "success", "warn", "error", "debug", "start", "trace", "fatal"]
     onOff:
       acceptReporters: true
       items: ["on", "off"]

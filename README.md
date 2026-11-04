@@ -2,7 +2,7 @@
 
 ![version](https://twexts.sdisk.us/api/v2/badge/@kamix/xterm/version) ![downloads](https://twexts.sdisk.us/api/v2/badge/@kamix/xterm/downloads) ![license](https://twexts.sdisk.us/api/v2/badge/@kamix/xterm/license)
 
-> A terminal integrated with the Scratch stage that allows for input and output. Powered by Xterm.
+> Xterm, for TurboWarp.
 
 ## 🌟 Highlights
 
