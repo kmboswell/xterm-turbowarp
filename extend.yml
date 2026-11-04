@@ -38,6 +38,12 @@ blocks:
   - opcode: clearTerminal
     blockType: command
     text: "clear terminal"
+  - opcode: terminalReady
+    blockType: boolean
+    text: "terminal ready?"
+  - opcode: lastTerminalError
+    blockType: reporter
+    text: "last terminal error"
 
   - "---"
 

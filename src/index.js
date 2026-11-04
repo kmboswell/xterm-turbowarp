@@ -2,6 +2,8 @@ import { initializeTerminal } from "./blocks/initializeTerminal.js";
 import { showTerminal } from "./blocks/showTerminal.js";
 import { hideTerminal } from "./blocks/hideTerminal.js";
 import { clearTerminal } from "./blocks/clearTerminal.js";
+import { terminalReady } from "./blocks/terminalReady.js";
+import { lastTerminalError } from "./blocks/lastTerminalError.js";
 import { promptUser } from "./blocks/promptUser.js";
 import { cancelPrompt } from "./blocks/cancelPrompt.js";
 import { logMessage } from "./blocks/logMessage.js";
@@ -21,6 +23,8 @@ export const blocks = {
   showTerminal,
   hideTerminal,
   clearTerminal,
+  terminalReady,
+  lastTerminalError,
   promptUser,
   cancelPrompt,
   logMessage,
@@ -155,6 +159,8 @@ export function setup() {
 
   const DEFAULT_THEME = "atom-one-dark";
 
+  const NOT_READY_ERROR = "Terminal is not initialized.";
+
   // scripts/inline-vendor.js replaces this literal with the bundled xterm and
   // xterm-addon-fit builds during `npm run build`, so starting the terminal never
   // makes a network request. The xterm stylesheet rides along in the same bundle.
@@ -177,11 +183,25 @@ export function setup() {
   let isVisible = false;
   let vendor = null;
 
+  let lastError = "";
   let activeTheme = DEFAULT_THEME;
   let timestampsEnabled = false;
   let levelFilter = null;
   let scopeFilter = null;
   const promptQueue = [];
+
+  function errorText(err) {
+    if (err && err.message) return String(err.message);
+    return String(err === undefined || err === null ? "unknown error" : err);
+  }
+
+  // Every block that needs a live terminal goes through this, so a failure is
+  // recorded in `last terminal error` instead of silently doing nothing.
+  function requireTerminal() {
+    if (terminal) return true;
+    lastError = NOT_READY_ERROR;
+    return false;
+  }
 
   function getStageCanvas() {
     const runtime =
@@ -326,11 +346,14 @@ export function setup() {
         window.addEventListener("resize", onWindowResize);
         terminal.onData(onTerminalData);
         setTimeout(safeFit, 50);
+        lastError = "";
         return terminal;
       })
       .catch((err) => {
-        // Allow a later "initialize terminal" block to retry.
+        // Allow a later "initialize terminal" block to retry, and keep the
+        // reason so `last terminal error` can explain the silence.
         initPromise = null;
+        lastError = "Could not initialize the terminal: " + errorText(err);
         throw err;
       });
 
@@ -338,7 +361,8 @@ export function setup() {
   }
 
   function show() {
-    if (!container || !terminal) return;
+    if (!requireTerminal()) return;
+    if (!container) return;
     container.style.display = "block";
     isVisible = true;
     // Refit on the next frame and once more after the layout has settled,
@@ -351,6 +375,7 @@ export function setup() {
   }
 
   function hide() {
+    if (!requireTerminal()) return;
     if (!container) return;
     container.style.display = "none";
     isVisible = false;
@@ -379,7 +404,9 @@ export function setup() {
   }
 
   function openPrompt(promptText, util) {
-    if (!terminal) {
+    // A prompt with no terminal can never be answered, so resolve it right away
+    // and leave the reason in `last terminal error`.
+    if (!requireTerminal()) {
       return Promise.resolve("");
     }
     const text = String(promptText === undefined || promptText === null ? "" : promptText);
@@ -426,19 +453,17 @@ export function setup() {
   }
 
   function writeRaw(text) {
-    if (terminal) {
-      terminal.write(text);
-    }
+    if (!requireTerminal()) return;
+    terminal.write(text);
   }
 
   function writeLine(text) {
-    if (terminal) {
-      terminal.writeln(text);
-    }
+    if (!requireTerminal()) return;
+    terminal.writeln(text);
   }
 
   function log(args) {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
 
     const levelKey = String(args.LEVEL);
     const scope = String(
@@ -460,7 +485,7 @@ export function setup() {
   }
 
   function drawBox(text) {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
 
     const cols = Math.max(10, terminal.cols || 80);
     const maxInnerWidth = Math.max(1, cols - 4);
@@ -509,13 +534,13 @@ export function setup() {
   }
 
   function drawRule() {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
     const width = Math.max(1, terminal.cols || 80);
     terminal.writeln(ANSI.DIM + "─".repeat(width) + ANSI.RESET);
   }
 
   function drawRuleLabeled(text) {
-    if (!terminal) return;
+    if (!requireTerminal()) return;
     const label = " " + String(text) + " ";
     const width = Math.max(1, terminal.cols || 80);
 
