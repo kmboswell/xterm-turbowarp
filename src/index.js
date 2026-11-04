@@ -21,6 +21,7 @@ import { dividerLabeled } from "./blocks/dividerLabeled.js";
 import { writeToTerminal } from "./blocks/writeToTerminal.js";
 import { writeLineToTerminal } from "./blocks/writeLineToTerminal.js";
 import { setTheme } from "./blocks/setTheme.js";
+import { disposeTerminal } from "./blocks/disposeTerminal.js";
 
 export const blocks = {
   initializeTerminal,
@@ -46,6 +47,7 @@ export const blocks = {
   writeToTerminal,
   writeLineToTerminal,
   setTheme,
+  disposeTerminal,
 };
 
 /**
@@ -192,6 +194,7 @@ export function setup() {
   let initPromise = null;
   let isVisible = false;
   let vendor = null;
+  let styleElement = null;
 
   let lastError = "";
   let activeTheme = DEFAULT_THEME;
@@ -263,6 +266,7 @@ export function setup() {
     style.id = "xterm-twext-css";
     style.textContent = (getVendor().css || "") + "\n" + XTERM_CSS_OVERRIDES;
     document.head.appendChild(style);
+    styleElement = style;
   }
 
   function safeFit() {
@@ -286,6 +290,7 @@ export function setup() {
     if (!stage) return null;
 
     container = document.createElement("div");
+    container.id = "xterm-twext-container";
     container.style.position = "absolute";
     container.style.top = "0";
     container.style.left = "0";
@@ -638,6 +643,54 @@ export function setup() {
     return initPromise;
   }
 
+  // Remove everything the extension added to the page and reset the init state
+  // so `initialize terminal` can build a fresh terminal. Shared by the dispose
+  // block and the runtime's RUNTIME_DISPOSED event.
+  function teardownTerminal() {
+    const oldTerminal = terminal;
+    terminal = null;
+    fitAddon = null;
+    if (oldTerminal) {
+      try {
+        oldTerminal.dispose();
+      } catch (err) {
+        // A terminal that failed to open may still need the rest of the cleanup.
+      }
+    }
+    // Resolve pending prompts (and key reads) rather than leaving threads stuck.
+    cancelPrompts(() => true);
+    while (keyQueue.length > 0) {
+      const resolve = keyQueue.shift();
+      resolve("");
+    }
+    if (resizeObserver) {
+      try {
+        resizeObserver.disconnect();
+      } catch (err) {
+        // Ignore: a fake or already-disconnected observer is harmless.
+      }
+      resizeObserver = null;
+    }
+    window.removeEventListener("resize", onWindowResize);
+    if (container && container.parentNode) {
+      container.parentNode.removeChild(container);
+    }
+    container = null;
+    isVisible = false;
+    if (styleElement && styleElement.parentNode) {
+      styleElement.parentNode.removeChild(styleElement);
+    }
+    styleElement = null;
+    initPromise = null;
+  }
+
+  function disposeTerminalState() {
+    teardownTerminal();
+    outputQueue.length = 0;
+    pendingLines.length = 0;
+    lastError = "";
+  }
+
   function show() {
     if (!requireTerminal()) return;
     if (!container) return;
@@ -905,6 +958,7 @@ export function setup() {
   // external stop path in scratch-vm emits one of these two events, so this is
   // what keeps a dead thread from blocking the queue forever.
   const runtime = Scratch.vm && Scratch.vm.runtime;
+  let removeRuntimeListeners = null;
   if (runtime && typeof runtime.on === "function") {
     const onStopAll = () => cancelPrompts(() => true);
     const onStopForTarget = (target) =>
@@ -912,15 +966,20 @@ export function setup() {
     const onProjectStart = () => {
       projectStartedAt = Date.now();
     };
+    const onRuntimeDisposed = () => {
+      disposeTerminalState();
+      if (removeRuntimeListeners) removeRuntimeListeners();
+    };
+    removeRuntimeListeners = () => {
+      if (typeof runtime.removeListener !== "function") return;
+      runtime.removeListener("PROJECT_STOP_ALL", onStopAll);
+      runtime.removeListener("STOP_FOR_TARGET", onStopForTarget);
+      runtime.removeListener("PROJECT_START", onProjectStart);
+      runtime.removeListener("RUNTIME_DISPOSED", onRuntimeDisposed);
+    };
     runtime.on("PROJECT_STOP_ALL", onStopAll);
     runtime.on("STOP_FOR_TARGET", onStopForTarget);
     runtime.on("PROJECT_START", onProjectStart);
-    runtime.on("RUNTIME_DISPOSED", () => {
-      if (typeof runtime.removeListener === "function") {
-        runtime.removeListener("PROJECT_STOP_ALL", onStopAll);
-        runtime.removeListener("STOP_FOR_TARGET", onStopForTarget);
-        runtime.removeListener("PROJECT_START", onProjectStart);
-      }
-    });
+    runtime.on("RUNTIME_DISPOSED", onRuntimeDisposed);
   }
 }

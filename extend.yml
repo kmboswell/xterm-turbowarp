@@ -163,3 +163,9 @@ blocks:
       THEME:
         type: string
         menu: themes
+
+  - "---"
+
+  - opcode: disposeTerminal
+    blockType: command
+    text: "dispose terminal"
