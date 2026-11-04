@@ -155,20 +155,14 @@ export function setup() {
 
   const DEFAULT_THEME = "atom-one-dark";
 
-  const XTERM_CSS_URL = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css";
-  const XTERM_JS_URL = "https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js";
-  const XTERM_FIT_URL =
-    "https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js";
-  const XTERM_CSS_INTEGRITY =
-    "sha384-LJcOxlx9IMbNXDqJ2axpfEQKkAYbFjJfhXexLfiRJhjDU81mzgkiQq8rkV0j6dVh";
-  const XTERM_JS_INTEGRITY =
-    "sha384-/nfmYPUzWMS6v2atn8hbljz7NE0EI1iGx34lJaNzyVjWGDzMv+ciUZUeJpKA3Glc";
-  const XTERM_FIT_INTEGRITY =
-    "sha384-AQLWHRKAgdTxkolJcLOELg4E9rE89CPE2xMy3tIRFn08NcGKPTsELdvKomqji+DL";
+  // scripts/inline-vendor.js replaces this literal with the bundled xterm and
+  // xterm-addon-fit builds during `npm run build`, so starting the terminal never
+  // makes a network request. The xterm stylesheet rides along in the same bundle.
+  const XTERM_VENDOR_BUNDLE = "@@XTERM_VENDOR_BUNDLE@@";
 
-  // Kept as an array of single-line rules: Twext re-indents setup code but leaves
-  // the contents of multi-line template literals untouched.
-  const XTERM_CSS = [
+  // Extra rules on top of the bundled xterm.css. Kept as an array of single-line
+  // strings: the build re-indents setup code but never string contents.
+  const XTERM_CSS_OVERRIDES = [
     ".xterm-viewport::-webkit-scrollbar { display: none !important; }",
     ".xterm-viewport { -ms-overflow-style: none !important; scrollbar-width: none !important; }",
     ".xterm { width: 100% !important; height: 100% !important; padding: 4px; box-sizing: border-box; }",
@@ -181,6 +175,7 @@ export function setup() {
   let resizeObserver = null;
   let initPromise = null;
   let isVisible = false;
+  let vendor = null;
 
   let activeTheme = DEFAULT_THEME;
   let timestampsEnabled = false;
@@ -196,42 +191,32 @@ export function setup() {
     return (runtime && runtime.canvas) || document.querySelector("canvas");
   }
 
+  // The inlined bundle is plain code: calling this function runs it once. No
+  // <script> tag, string-compiled code or Blob URL is involved, so it cannot be
+  // blocked by a missing inline-script permission.
+  function getVendor() {
+    if (vendor) return vendor;
+    // Test seam: a fake implementation can be installed before the first
+    // initialize so tests never evaluate the full xterm bundle.
+    const override =
+      typeof window !== "undefined" ? window.__XTERM_TEST_VENDOR__ : null;
+    if (override) {
+      vendor = override;
+      return vendor;
+    }
+    if (typeof XTERM_VENDOR_BUNDLE !== "function") {
+      throw new Error("The bundled xterm code is missing. Run `npm run build`.");
+    }
+    vendor = XTERM_VENDOR_BUNDLE();
+    return vendor;
+  }
+
   function injectStyles() {
     if (document.getElementById("xterm-twext-css")) return;
     const style = document.createElement("style");
     style.id = "xterm-twext-css";
-    style.textContent = XTERM_CSS;
+    style.textContent = (getVendor().css || "") + "\n" + XTERM_CSS_OVERRIDES;
     document.head.appendChild(style);
-  }
-
-  function loadScripts() {
-    if (window.Terminal && window.FitAddon) return Promise.resolve();
-    return new Promise((resolve, reject) => {
-      injectStyles();
-
-      const link = document.createElement("link");
-      link.rel = "stylesheet";
-      link.href = XTERM_CSS_URL;
-      link.integrity = XTERM_CSS_INTEGRITY;
-      link.crossOrigin = "anonymous";
-      document.head.appendChild(link);
-
-      const script = document.createElement("script");
-      script.src = XTERM_JS_URL;
-      script.integrity = XTERM_JS_INTEGRITY;
-      script.crossOrigin = "anonymous";
-      script.onload = () => {
-        const fitScript = document.createElement("script");
-        fitScript.src = XTERM_FIT_URL;
-        fitScript.integrity = XTERM_FIT_INTEGRITY;
-        fitScript.crossOrigin = "anonymous";
-        fitScript.onload = resolve;
-        fitScript.onerror = reject;
-        document.head.appendChild(fitScript);
-      };
-      script.onerror = reject;
-      document.head.appendChild(script);
-    });
   }
 
   function safeFit() {
@@ -315,14 +300,16 @@ export function setup() {
     // cannot both build a terminal.
     if (initPromise) return initPromise;
 
-    initPromise = loadScripts()
+    initPromise = Promise.resolve()
       .then(() => {
+        injectStyles();
         const host = ensureContainer();
         if (!host) {
           throw new Error("Xterm could not find the stage canvas.");
         }
 
-        terminal = new window.Terminal({
+        const bundle = getVendor();
+        terminal = new bundle.Terminal({
           // Blinking is off by default; it is enabled only for the duration of a prompt.
           cursorBlink: false,
           // Block keyboard input unless a prompt is waiting for it.
@@ -333,7 +320,7 @@ export function setup() {
           theme: THEMES[activeTheme],
         });
 
-        fitAddon = new window.FitAddon.FitAddon();
+        fitAddon = new bundle.FitAddon.FitAddon();
         terminal.loadAddon(fitAddon);
         terminal.open(host);
         window.addEventListener("resize", onWindowResize);

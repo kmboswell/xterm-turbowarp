@@ -12,9 +12,9 @@
 
 ## ℹ️ Overview
 
-> [!IMPORTANT]
+> [!NOTE]
 >
-> **Known issue:** You must be online to use this extension, because it must fetch Xterm's code to render the terminal.
+> The build inlines xterm and the fit addon into `dist/extension.js`, so the terminal works offline and makes no network request. The `xterm` and `xterm-addon-fit` package names are deprecated upstream in favour of `@xterm/xterm` and `@xterm/addon-fit`; this project still pins the old names because 5.3.0 and 0.8.0 are the versions the extension was written against.
 
 This extension replaces the Scratch stage with a virtual terminal, powered by Xterm. It is not a debugging tool, it's designed for operating systems in Scratch instead.
 
