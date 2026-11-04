@@ -160,6 +160,7 @@ export function setup() {
   const DEFAULT_THEME = "atom-one-dark";
 
   const NOT_READY_ERROR = "Terminal is not initialized.";
+  const OUTPUT_BUFFER_LIMIT = 1000;
 
   // scripts/inline-vendor.js replaces this literal with the bundled xterm and
   // xterm-addon-fit builds during `npm run build`, so starting the terminal never
@@ -189,6 +190,11 @@ export function setup() {
   let levelFilter = null;
   let scopeFilter = null;
   const promptQueue = [];
+  // Output produced before the terminal exists is held here as already-formatted
+  // entries, so the filters and timestamp style from write time still apply when
+  // it is flushed. Bounded so a project that never initializes cannot grow it
+  // without limit; the oldest entry is dropped first.
+  const outputQueue = [];
 
   function errorText(err) {
     if (err && err.message) return String(err.message);
@@ -346,6 +352,9 @@ export function setup() {
         window.addEventListener("resize", onWindowResize);
         terminal.onData(onTerminalData);
         setTimeout(safeFit, 50);
+        // Anything written while the terminal was starting goes out now, before
+        // any later output can overtake it.
+        flushOutput();
         lastError = "";
         return terminal;
       })
@@ -452,26 +461,53 @@ export function setup() {
       .filter((part) => part);
   }
 
+  function pushOutput(entry) {
+    outputQueue.push(entry);
+    if (outputQueue.length > OUTPUT_BUFFER_LIMIT) {
+      outputQueue.shift();
+    }
+  }
+
+  function writeOutput(entry) {
+    if (!terminal) {
+      pushOutput(entry);
+      return;
+    }
+    if (entry.kind === "writeln") {
+      terminal.writeln(entry.text);
+    } else {
+      terminal.write(entry.text);
+    }
+  }
+
+  function flushOutput() {
+    if (!terminal) return;
+    while (outputQueue.length > 0) {
+      const entry = outputQueue.shift();
+      if (entry.kind === "writeln") {
+        terminal.writeln(entry.text);
+      } else {
+        terminal.write(entry.text);
+      }
+    }
+  }
+
   function writeRaw(text) {
-    if (!requireTerminal()) return;
-    terminal.write(text);
+    writeOutput({ kind: "write", text: String(text) });
   }
 
   function writeLine(text) {
-    if (!requireTerminal()) return;
-    terminal.writeln(text);
+    writeOutput({ kind: "writeln", text: String(text) });
   }
 
-  function log(args) {
-    if (!requireTerminal()) return;
-
+  function formatLog(args) {
     const levelKey = String(args.LEVEL);
     const scope = String(
       args.SCOPE === undefined || args.SCOPE === null ? "" : args.SCOPE,
     ).trim();
 
-    if (levelFilter && levelFilter.indexOf(levelKey) === -1) return;
-    if (scopeFilter && scopeFilter.indexOf(scope) === -1) return;
+    if (levelFilter && levelFilter.indexOf(levelKey) === -1) return null;
+    if (scopeFilter && scopeFilter.indexOf(scope) === -1) return null;
 
     const config = LEVELS[levelKey] || LEVELS.info;
     const timestamp = timestampsEnabled
@@ -481,7 +517,13 @@ export function setup() {
     const prefix = timestamp + config.color + ANSI.BOLD + config.icon + " " + label + ANSI.RESET;
     const scopeFormat = scope ? ANSI.DIM + "[" + scope + "]" + ANSI.RESET + " " : "";
 
-    terminal.writeln(prefix + " " + scopeFormat + String(args.TEXT));
+    return { kind: "writeln", text: prefix + " " + scopeFormat + String(args.TEXT) };
+  }
+
+  function log(args) {
+    const entry = formatLog(args);
+    if (!entry) return;
+    writeOutput(entry);
   }
 
   function drawBox(text) {
