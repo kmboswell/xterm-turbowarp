@@ -36,8 +36,8 @@ test("the built bundle makes no CDN request", () => {
 
 test("the bundled libraries keep their licence banner", () => {
   assert.ok(bundle.includes("Bundled dependencies, inlined at build time"));
-  assert.ok(bundle.includes("xterm 5.3.0"));
-  assert.ok(bundle.includes("xterm-addon-fit 0.8.0"));
+  assert.ok(bundle.includes("@xterm/xterm 6.0.0"));
+  assert.ok(bundle.includes("@xterm/addon-fit 0.11.0"));
   assert.ok(bundle.includes("MIT licence"));
 });
 

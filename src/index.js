@@ -176,9 +176,10 @@ export function setup() {
   const OUTPUT_BUFFER_CHARS = 100000;
   const HISTORY_LIMIT = 100;
 
-  // scripts/inline-vendor.js replaces this literal with the bundled xterm and
-  // xterm-addon-fit builds during `npm run build`, so starting the terminal never
-  // makes a network request. The xterm stylesheet rides along in the same bundle.
+  // scripts/inline-vendor.js replaces this literal with the bundled @xterm/xterm
+  // and @xterm/addon-fit builds during `npm run build`, so starting the terminal
+  // never makes a network request. The xterm stylesheet rides along in the same
+  // bundle.
   const XTERM_VENDOR_BUNDLE = "@@XTERM_VENDOR_BUNDLE@@";
 
   // Extra rules on top of the bundled xterm.css. Kept as an array of single-line

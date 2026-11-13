@@ -1,6 +1,6 @@
 /**
  * Post-build step: replace the vendor placeholder that src/index.js leaves in
- * the compiled extension with the actual xterm and xterm-addon-fit sources.
+ * the compiled extension with the actual @xterm/xterm and @xterm/addon-fit sources.
  *
  * The placeholder is the string literal `"@@XTERM_VENDOR_BUNDLE@@"`, which sits
  * in an expression position:
@@ -19,39 +19,39 @@
  * extensions on the page.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
-import { createRequire } from "node:module";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import vm from "node:vm";
 
-const require = createRequire(import.meta.url);
-
 const DIST_FILE = resolve("dist/extension.js");
+const VENDOR_DIR = resolve("vendor");
 const PLACEHOLDER = '"@@XTERM_VENDOR_BUNDLE@@"';
 
-function readPackageVersion(name) {
-  return JSON.parse(readFileSync(require.resolve(`${name}/package.json`), "utf8")).version;
+// The registry compiles this from the published source and installs nothing, so
+// the libraries are read from the committed copies in vendor/ rather than from
+// node_modules. `npm run sync-vendor` refreshes them from the pinned versions.
+function readVendorFile(name) {
+  const path = resolve(VENDOR_DIR, name);
+  if (!existsSync(path)) {
+    throw new Error(`Missing ${path}. Run \`npm run sync-vendor\` first.`);
+  }
+  return readFileSync(path, "utf8").replace(/\n?\/\/[#@] sourceMappingURL=.*$/gm, "").trim();
 }
 
-function readLibrarySource(name, path) {
-  return readFileSync(require.resolve(`${name}/${path}`), "utf8")
-    .replace(/\n?\/\/[#@] sourceMappingURL=.*$/gm, "")
-    .trim();
-}
-
-const xtermVersion = readPackageVersion("xterm");
-const fitVersion = readPackageVersion("xterm-addon-fit");
+const versions = JSON.parse(readVendorFile("versions.json"));
+const xtermVersion = versions["@xterm/xterm"];
+const fitVersion = versions["@xterm/addon-fit"];
 
 const BANNER = `/*!
  * Bundled dependencies, inlined at build time by scripts/inline-vendor.js.
  *
- * xterm ${xtermVersion}
+ * @xterm/xterm ${xtermVersion}
  * Copyright (c) 2017-2019, The xterm.js authors (https://github.com/xtermjs/xterm.js)
  * Copyright (c) 2014-2016, SourceLair Private Company (https://www.sourcelair.com)
  * Copyright (c) 2012-2013, Christopher Jeffrey (https://github.com/chjj/)
  * MIT licence.
  *
- * xterm-addon-fit ${fitVersion}
+ * @xterm/addon-fit ${fitVersion}
  * Copyright (c) 2019, The xterm.js authors (https://github.com/xtermjs/xterm.js)
  * MIT licence.
  *
@@ -72,9 +72,6 @@ const BANNER = `/*!
  * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * Both packages are deprecated upstream in favour of @xterm/xterm and
- * @xterm/addon-fit; these are the versions the extension targets.
  */`;
 
 function commonJsWrapper(variable, source) {
@@ -86,9 +83,9 @@ function commonJsWrapper(variable, source) {
   ].join("\n");
 }
 
-const xtermSource = readLibrarySource("xterm", "lib/xterm.js");
-const fitSource = readLibrarySource("xterm-addon-fit", "lib/xterm-addon-fit.js");
-const css = readFileSync(require.resolve("xterm/css/xterm.css"), "utf8").trim();
+const xtermSource = readVendorFile("xterm.js");
+const fitSource = readVendorFile("addon-fit.js");
+const css = readVendorFile("xterm.css");
 
 const payload = [
   "(function () {",
@@ -125,5 +122,5 @@ for (const forbidden of ["cdn.jsdelivr", "unpkg.com", "cdnjs.cloudflare.com"]) {
 
 writeFileSync(DIST_FILE, output, "utf8");
 console.log(
-  `Inlined xterm ${xtermVersion} and xterm-addon-fit ${fitVersion} (${output.length} bytes).`,
+  `Inlined @xterm/xterm ${xtermVersion} and @xterm/addon-fit ${fitVersion} (${output.length} bytes).`,
 );

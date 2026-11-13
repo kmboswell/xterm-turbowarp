@@ -168,7 +168,7 @@ function installBrowserStubs(window) {
 
 /**
  * Load the built extension in a jsdom window. A fake Terminal (and fit addon) is
- * installed through the extension's test seam, so the real 280 kB xterm bundle
+ * installed through the extension's test seam, so the real xterm bundle
  * is present in the file but never evaluated by these tests.
  *
  * `failInit` makes the fake Terminal constructor throw, and `failOpen` makes
