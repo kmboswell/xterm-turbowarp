@@ -1,17 +1,17 @@
 {
   "name": "xterm-turbowarp",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Xterm, for TurboWarp.",
   "license": "Apache-2.0",
   "author": "Kamix",
   "type": "module",
   "scripts": {
     "validate": "extend validate",
-    "build": "extend build && node scripts/inline-vendor.js",
+    "build": "extend build",
     "test": "npm run build && node --test \"tests/*.test.js\""
   },
   "devDependencies": {
-    "@triflare/extend": "^0.2.0",
+    "@triflare/extend": "^0.3.0",
     "jsdom": "30.1.3",
     "xterm": "5.3.0",
     "xterm-addon-fit": "0.8.0"
